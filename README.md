@@ -95,10 +95,7 @@ The Activate uses a fully different wire format from Mira Mode:
 
 The integration was reverse-engineered from the official `uk.co.mirashowers`
 Android app combined with a live HCI snoop capture of the app driving the
-shower. Detailed protocol writeup: [`docs/PROTOCOL.md`](docs/PROTOCOL.md),
-[`docs/SESSION_ESTABLISHMENT.md`](docs/SESSION_ESTABLISHMENT.md),
-[`docs/CORRECTIONS.md`](docs/CORRECTIONS.md) (what the static decode got
-wrong vs. what the live capture proved).
+shower. Detailed protocol writeup: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Status
 
