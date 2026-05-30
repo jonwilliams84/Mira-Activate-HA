@@ -32,6 +32,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .mira_protocol import (
@@ -76,6 +77,13 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.entry = entry
         self.address: str = entry.data["address"]
+        self.device_info = DeviceInfo(
+            identifiers={(DOMAIN, self.address)},
+            name=entry.title or f"Mira Activate {self.address}",
+            manufacturer="Mira (Kohler)",
+            model="Mira Activate",
+            connections={("bluetooth", self.address)},
+        )
         self._client: BleakClient | None = None
         self._lock = asyncio.Lock()  # serializes ops, per spec §3.3
         self._assembler = FrameAssembler()

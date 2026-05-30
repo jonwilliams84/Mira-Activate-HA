@@ -44,6 +44,7 @@ class _CoordNumberBase(CoordinatorEntity[MiraActivateCoordinator], NumberEntity)
     def __init__(self, coord: MiraActivateCoordinator, uid_suffix: str) -> None:
         super().__init__(coord)
         self._attr_unique_id = f"{coord.address}_{uid_suffix}"
+        self._attr_device_info = coord.device_info
         self._cached: float | None = self._read_from_coord()
 
     def _read_from_coord(self) -> float | None:

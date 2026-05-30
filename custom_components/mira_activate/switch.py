@@ -49,6 +49,7 @@ class _OutletBase(CoordinatorEntity[MiraActivateCoordinator], SwitchEntity):
     def __init__(self, coord: MiraActivateCoordinator) -> None:
         super().__init__(coord)
         self._attr_unique_id = f"{coord.address}_{self._state_key}"
+        self._attr_device_info = coord.device_info
         self._is_on: bool | None = self._read_state()
 
     def _read_state(self) -> bool | None:
