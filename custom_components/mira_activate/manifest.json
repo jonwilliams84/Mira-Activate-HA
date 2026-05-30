@@ -1,7 +1,7 @@
 {
   "domain": "mira_activate",
   "name": "Mira Activate Shower",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "codeowners": ["@jonwilliams84"],
   "config_flow": true,
   "documentation": "https://github.com/jonwilliams84/Mira-Activate-HA",
