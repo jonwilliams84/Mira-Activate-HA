@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "codeowners": ["@jonwilliams84"],
   "config_flow": true,
-  "documentation": "https://github.com/jonwilliams84/mira_activate",
+  "documentation": "https://github.com/jonwilliams84/Mira-Activate-HA",
+  "issue_tracker": "https://github.com/jonwilliams84/Mira-Activate-HA/issues",
   "iot_class": "local_polling",
   "dependencies": ["bluetooth"],
   "requirements": [
