@@ -1,0 +1,481 @@
+"""Mira Activate BLE coordinator.
+
+A single persistent BLE connection per config entry. Serializes all app-layer
+ops over the queue (spec §3.3 — "no per-frame sequence id, queue is strictly
+serialized"). 10s op timeout per Lf5/c;->i.
+
+Routes through HA's bluetooth integration (bleak-esphome backend), so any
+configured BT proxy is used transparently.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import timedelta
+from typing import Any
+
+from bleak import BleakClient
+from bleak.backends.device import BLEDevice
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    establish_connection,
+)
+from homeassistant.components.bluetooth import (
+    async_address_present,
+    async_ble_device_from_address,
+    async_register_callback,
+    BluetoothCallbackMatcher,
+    BluetoothChange,
+    BluetoothScanningMode,
+    BluetoothServiceInfoBleak,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .mira_protocol import (
+    FrameAssembler,
+    IncompleteError,
+    InvalidFrameError,
+    NOTIFY_CHAR_UUID,
+    OP_SET_TEMPERATURE,
+    OP_UNIT_PRIME,
+    OUTLET_BIT_0,
+    OUTLET_BIT_1,
+    OUTLET_BIT_2,
+    OUTLET_PAUSE,
+    SERVICE_UUID,
+    WRITE_CHAR_UUID,
+    frame_set_temperature,
+    frame_unit_prime,
+    parse_unit_prime,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+DOMAIN = "mira_activate"
+# 30s — Mode integration's setting. The Activate drops the BLE link after
+# ~36s idle, so each poll usually triggers a reconnect. The actual
+# responsiveness floor is dominated by reconnect time, not poll cadence.
+POLL_INTERVAL = timedelta(seconds=10)  # was 30 — trade BT load for faster
+                                       # detection of panel-side state changes
+OP_TIMEOUT = 10.0  # Activate's notifications sometimes arrive 4-8s after the
+                   # write; shorter timeouts just give up before the reply.
+
+
+class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """One-connection-per-device coordinator."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"mira_activate[{entry.data['address']}]",
+            update_interval=POLL_INTERVAL,
+        )
+        self.entry = entry
+        self.address: str = entry.data["address"]
+        self._client: BleakClient | None = None
+        self._lock = asyncio.Lock()  # serializes ops, per spec §3.3
+        self._assembler = FrameAssembler()
+        self._response_event: asyncio.Event = asyncio.Event()
+        self._last_frame: Any = None
+        self._unsub_bt_callback = None
+        # Cached state pushed to entities (see AB_2B_DECODE.md).
+        # outlet1_on / outlet2_on / outlet0_on are booleans driven by the
+        # bit-packed outlet_state byte in payload[13]. flow_lpm is what we'll
+        # echo back in the next 0xAB write (× 4 over the wire).
+        self._state: dict[str, Any] = {
+            "available": False,
+            "session_ready": False,
+            "running": False,
+            "outlet0_on": False,
+            "outlet1_on": False,
+            "outlet2_on": False,
+            "target_temp": 38.0,
+            "flow_lpm": 12,  # sane default; gets replaced on first poll
+            "measured_temp": None,
+            "status_code": None,
+            "iot_status": None,
+            "paused": False,
+            "error": False,
+            "raw_status0": None,
+            "raw_outlet_state": None,
+        }
+
+    # ---- Lifecycle ----------------------------------------------------------
+
+    async def async_init(self) -> None:
+        """Register for BT availability callbacks. Do not block setup."""
+        self._unsub_bt_callback = async_register_callback(
+            self.hass,
+            self._on_bt_advertisement,
+            BluetoothCallbackMatcher(address=self.address),
+            BluetoothScanningMode.PASSIVE,
+        )
+        # Schedule first refresh in the background
+        self.hass.async_create_task(self.async_config_entry_first_refresh())
+
+    async def async_close(self) -> None:
+        if self._unsub_bt_callback is not None:
+            self._unsub_bt_callback()
+            self._unsub_bt_callback = None
+        await self._disconnect()
+
+    # ---- BT callbacks -------------------------------------------------------
+
+    @callback
+    def _on_bt_advertisement(
+        self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
+    ) -> None:
+        """Track availability based on advertising presence."""
+        was_available = self._state["available"]
+        self._state["available"] = True
+        if not was_available:
+            self.async_set_updated_data(self._state)
+
+    # ---- Connection management ---------------------------------------------
+
+    async def _get_ble_device(self) -> BLEDevice | None:
+        return async_ble_device_from_address(self.hass, self.address, connectable=True)
+
+    async def _ensure_connected(self) -> BleakClient:
+        if self._client is not None and self._client.is_connected:
+            return self._client
+        return await self._connect_and_bond(retry_after_clear=True)
+
+    async def _connect_and_bond(self, retry_after_clear: bool) -> BleakClient:
+        """Connect and enable notifications. If start_notify fails with
+        Insufficient authentication, run a pair() and retry; if still failing,
+        clear the proxy's bond cache and recurse once."""
+        device = await self._get_ble_device()
+        if device is None:
+            raise UpdateFailed(f"Device {self.address} not in BT registry")
+        _LOGGER.warning(
+            "Establishing BLE connection to %s (retry_after_clear=%s)",
+            self.address, retry_after_clear,
+        )
+        client = await establish_connection(
+            BleakClientWithServiceCache,
+            device,
+            self.address,
+            disconnected_callback=self._on_disconnected,
+            max_attempts=3,
+        )
+        self._assembler.reset()
+        self._response_event.clear()
+
+        # Fast path: try start_notify without an explicit pair() — saves
+        # 1-2s on every reconnect when the proxy is still bonded.
+        try:
+            await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
+            self._client = client
+            return client
+        except Exception as exc:  # noqa: BLE001
+            if "Insufficient authentication" not in str(exc):
+                raise
+
+        _LOGGER.warning("CCCD auth fail — running pair() recovery")
+        try:
+            await client.pair()
+            await asyncio.sleep(0.5)
+        except Exception as pexc:  # noqa: BLE001
+            _LOGGER.warning("pair() during recovery raised: %s", pexc)
+
+        try:
+            await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
+            self._client = client
+            return client
+        except Exception as exc2:  # noqa: BLE001
+            if "Insufficient authentication" not in str(exc2) or not retry_after_clear:
+                raise
+
+        _LOGGER.warning("Still auth=5 after re-pair — clearing proxy bond cache")
+        await self._clear_cache_via_client(client)
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self._client = None
+        await asyncio.sleep(2.0)
+        return await self._connect_and_bond(retry_after_clear=False)
+
+    async def _clear_cache_via_client(self, client: BleakClient) -> None:
+        """Clear the bond cache + unpair on the proxy currently servicing this
+        client. We reach the underlying aioesphomeapi APIClient through the
+        bleak-esphome backend."""
+        addr_int = int(self.address.replace(":", ""), 16)
+        # Try multiple known attribute paths to find the APIClient.
+        api = None
+        backend = getattr(client, "_backend", None)
+        for attr in ("_client", "client", "api", "_api_client"):
+            if backend is not None and getattr(backend, attr, None) is not None:
+                api = getattr(backend, attr)
+                _LOGGER.warning("reached proxy APIClient via client._backend.%s (%s)", attr, type(api).__name__)
+                break
+        if api is None:
+            _LOGGER.warning("could not reach proxy APIClient — backend=%r attrs=%s", backend, dir(backend) if backend else "no backend")
+            return
+        for op_name, op_call in (
+            ("unpair",      lambda: api.bluetooth_device_unpair(addr_int)),
+            ("clear_cache", lambda: api.bluetooth_device_clear_cache(addr_int)),
+        ):
+            try:
+                await asyncio.wait_for(op_call(), timeout=8)
+                _LOGGER.warning("proxy %s OK for %s", op_name, self.address)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("proxy %s raised: %s: %s", op_name, type(exc).__name__, exc)
+
+    def _on_disconnected(self, client: BleakClient) -> None:
+        _LOGGER.warning("BLE disconnect from %s", self.address)
+        self._client = None
+        self._state["available"] = False
+
+    async def _disconnect(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("disconnect raised: %s", exc)
+            self._client = None
+
+    def _on_notify(self, _char, data: bytearray) -> None:
+        try:
+            frame = self._assembler.feed(bytes(data))
+        except IncompleteError:
+            return
+        except InvalidFrameError as e:
+            _LOGGER.warning("invalid frame from %s: %s", self.address, e)
+            self._assembler.reset()
+            return
+        self._last_frame = frame
+        self._response_event.set()
+
+    # ---- Op primitives ------------------------------------------------------
+
+    async def _request(self, frame: bytes) -> Any:
+        """Send a frame and await one response. Serialized via _lock."""
+        async with self._lock:
+            client = await self._ensure_connected()
+            self._assembler.reset()
+            self._response_event.clear()
+            self._last_frame = None
+            _LOGGER.debug("→ %s", frame.hex())
+            # The official app uses ATT Write Command (response=False) — no
+            # ATT-layer ACK round-trip; the device's notification on 267f0003
+            # is the application-level "I got it" signal.
+            await client.write_gatt_char(
+                WRITE_CHAR_UUID, frame, response=False
+            )
+            try:
+                await asyncio.wait_for(
+                    self._response_event.wait(), timeout=OP_TIMEOUT
+                )
+            except asyncio.TimeoutError as e:
+                raise UpdateFailed(
+                    f"timeout waiting for response to {frame.hex()}"
+                ) from e
+            return self._last_frame
+
+    # ---- Coordinator update loop -------------------------------------------
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Poll the device (one 0x2B Unit Prime read per cycle)."""
+        if not async_address_present(self.hass, self.address, connectable=True):
+            self._state["available"] = False
+            return self._state
+        try:
+            frame = await self._request(frame_unit_prime())
+        except UpdateFailed:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise UpdateFailed(f"poll failed: {e}") from e
+        # Parse the 0x2B response per AB_2B_DECODE.md §2.
+        if frame is not None:
+            payload_hex = frame.payload.hex()
+            parsed = parse_unit_prime(frame.payload)
+            if parsed:
+                self._state.update(parsed)
+                # available: prefer parsed session_ready (bit 6 of byte 0);
+                # fall back to "we got a valid response at all".
+                self._state["available"] = True
+                _LOGGER.warning(
+                    "0x2B ← %s : target=%.1f°C flow=%dLPM outlet=0x%02x "
+                    "running=%s paused=%s error=%s session_ready=%s "
+                    "iot=0x%02x measured=%.1f",
+                    payload_hex,
+                    parsed["target_temp"],
+                    parsed["flow_lpm"],
+                    parsed["outlet_state"],
+                    parsed["running"],
+                    parsed["paused"],
+                    parsed["error"],
+                    parsed["session_ready"],
+                    parsed["iot_status"],
+                    parsed["measured_temp"],
+                )
+            else:
+                _LOGGER.warning(
+                    "0x2B payload too short to parse: %s", payload_hex
+                )
+                self._state["available"] = True
+        else:
+            self._state["available"] = False
+        return self._state
+
+    # ---- Public API used by entities ---------------------------------------
+
+    async def async_set_outlet1(self, on: bool) -> None:
+        """Toggle outlet B (bit 1 / 0x02). Verified rain head."""
+        self._state["outlet1_on"] = on
+        await self._send_temperature_frame()
+
+    async def async_set_outlet0(self, on: bool) -> None:
+        """Toggle outlet A (bit 0 / 0x01). Inferred handheld."""
+        self._state["outlet0_on"] = on
+        await self._send_temperature_frame()
+
+    async def async_set_flow_rate(self, flow_raw: int) -> None:
+        """Set flow rate. `flow_raw` is the wire byte (LPM × 4). Cap 64."""
+        self._state["flow_raw"] = max(0, min(int(flow_raw), 64))
+        await self._send_temperature_frame()
+
+    async def _run_brute_force_probe(self) -> None:
+        """Try a series of candidate frames and log every response.
+
+        Goal: find the opcode that actually starts water flowing on the
+        Mira Activate. Each candidate frame is sent, then we wait up to
+        2s for a response, log it, and move on. After the sequence, the
+        regular poll resumes — if any candidate flipped an outlet bit
+        in the device's response payload, we have our answer.
+        """
+        from datetime import datetime
+        ts = datetime.now().strftime("%y%m%d%H%M%S")  # 12 chars
+        # Frame builder helpers (raw — bypass the typed builders).
+        def _f(opcode: int, payload: bytes) -> bytes:
+            frame = bytes([0xAA, 0x55, 0x00, opcode, len(payload)]) + payload
+            return frame + bytes([((~sum(frame) + 1) & 0xFF)])
+        candidates = [
+            # Most likely to flip iot status: 0xF8 Write Commissioning State.
+            # Try each value 0..3; if writing 0x02 makes iot in the next poll
+            # decode to 2, we've found the unblock.
+            ("F8_state0",  _f(0xF8, bytes([0x00]))),
+            ("F8_state2",  _f(0xF8, bytes([0x02]))),
+            ("F8_state3",  _f(0xF8, bytes([0x03]))),
+            ("F8_state1",  _f(0xF8, bytes([0x01]))),
+            # 0xC0 reads bathroom name (per APK f2$c.a) — also serves as a
+            # session-establishment ping; harmless to re-send.
+            ("C0_v9000",  _f(0xC0, ("9000" + ts).encode("ascii").ljust(18, b"\x00"))),
+            # 0xAB outlet write (what we've been doing).
+            ("AB_o1_on",  _f(0xAB, bytes([0x01, 0x7C, 0x54, 0x04]))),
+            # 0xC2 sub-commands — Write SSid / Tenant id / etc., possible iot
+            # auth side door.
+            ("C2_sub00",  _f(0xC2, bytes([0x00]))),
+            ("C2_sub01",  _f(0xC2, bytes([0x01]))),
+            # 0xDD / 0x9B — last-ditch GCS commands.
+            ("DD_empty",  _f(0xDD, b"")),
+            ("9B_zeros",  _f(0x9B, bytes(16))),
+            # Final AB write to see if outlet flips after all the state changes.
+            ("AB_o1_on_post", _f(0xAB, bytes([0x01, 0x7C, 0x54, 0x04]))),
+        ]
+        # Re-entry guard: if a probe is already running, ignore subsequent toggles.
+        if getattr(self, "_probe_running", False):
+            _LOGGER.warning("PROBE: already running — ignoring re-toggle")
+            return
+        self._probe_running = True
+        _LOGGER.warning("PROBE: starting brute-force candidate sweep, %d frames, ts=%s", len(candidates), ts)
+        for name, frame in candidates:
+            try:
+                async with self._lock:
+                    client = await self._ensure_connected()
+                    self._assembler.reset()
+                    self._response_event.clear()
+                    self._last_frame = None
+                    _LOGGER.warning("PROBE → %s : %s", name, frame.hex())
+                    try:
+                        await client.write_gatt_char(WRITE_CHAR_UUID, frame, response=True)
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("PROBE × %s write failed: %s", name, e)
+                        await asyncio.sleep(0.5)
+                        continue
+                    try:
+                        await asyncio.wait_for(self._response_event.wait(), timeout=2.5)
+                        f = self._last_frame
+                        if f is not None:
+                            _LOGGER.warning(
+                                "PROBE ← %s : opcode=0x%02X payload=%s",
+                                name, f.opcode, f.payload.hex(),
+                            )
+                        else:
+                            _LOGGER.warning("PROBE ← %s : (no frame parsed)", name)
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("PROBE × %s : no response in 2.5s", name)
+                await asyncio.sleep(0.7)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.warning("PROBE × %s raised: %s: %s", name, type(e).__name__, e)
+                await asyncio.sleep(0.7)
+        _LOGGER.warning("PROBE: sweep complete")
+        self._probe_running = False
+
+    async def async_set_temperature(self, temp_c: float) -> None:
+        """Set target temperature (°C)."""
+        self._state["target_temp"] = temp_c
+        await self._send_temperature_frame()
+
+    async def async_turn_off_all(self) -> None:
+        """Emergency "turn off all outlets" — mirrors the app's
+        turnOffAllOutlets path: flags=1, temp=0, flow=0, outlet_state=0."""
+        self._state["outlet0_on"] = False
+        self._state["outlet1_on"] = False
+        self._state["outlet2_on"] = False
+        frame = frame_set_temperature(
+            flags=1, temp_x10=0, flow_x4=0, outlet_state=0
+        )
+        try:
+            await self._request(frame)
+        except UpdateFailed as e:
+            _LOGGER.error("turn-off-all failed: %s", e)
+            raise
+
+    async def _send_temperature_frame(self) -> None:
+        """Build and send a 0xAB frame from the cached desired state.
+
+        Encoding corrected from live HCI snoop 2026-05-30:
+          flags           = 0 (the app's `flags` is also always 0 for normal ops)
+          temp_x10        = target_temp * 10 (split between byte 5 bit 0 & byte 6)
+          byte 7 (flow)   = the device's reported flow_raw (mirror what we got
+                            from the last poll — the app does the same)
+          byte 8 (outlet) = bit 0=outlet A, bit 1=outlet B, 0x40=pause
+        """
+        temp_x10 = int(round(self._state["target_temp"] * 10))
+        # Echo the last-observed flow_raw back. App defaults to 64 if unknown.
+        flow_x4 = int(self._state.get("flow_raw") or 64)
+        outlet_state = 0
+        if self._state.get("outlet0_on"):
+            outlet_state |= OUTLET_BIT_0  # 0x01
+        if self._state.get("outlet1_on"):
+            outlet_state |= OUTLET_BIT_1  # 0x02
+        # outlet2 bit (0x04) is unused on the live device — skip it entirely
+        # rather than send an invalid bit the firmware ignores.
+        if self._state.get("paused"):
+            outlet_state |= OUTLET_PAUSE  # 0x40
+        frame = frame_set_temperature(
+            flags=0,
+            temp_x10=temp_x10,
+            flow_x4=flow_x4,
+            outlet_state=outlet_state,
+        )
+        _LOGGER.warning(
+            "0xAB → flags=0 temp_x10=%d flow_x4=%d outlet_state=0x%02x "
+            "frame=%s",
+            temp_x10,
+            flow_x4,
+            outlet_state,
+            frame.hex(),
+        )
+        try:
+            await self._request(frame)
+        except UpdateFailed as e:
+            _LOGGER.error("set-temperature failed: %s", e)
+            raise

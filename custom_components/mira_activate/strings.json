@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "bluetooth_confirm": {
+        "description": "Set up {name}?"
+      },
+      "user": {
+        "description": "Select a Mira Activate device",
+        "data": {
+          "address": "Device"
+        }
+      }
+    },
+    "abort": {
+      "no_devices_found": "No Mira Activate devices found.",
+      "already_configured": "Already configured."
+    }
+  }
+}
