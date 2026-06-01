@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from time import monotonic
 from typing import Any
 
 from bleak import BleakClient
@@ -64,6 +65,13 @@ POLL_INTERVAL = timedelta(seconds=10)  # was 30 — trade BT load for faster
 OP_TIMEOUT = 10.0  # Activate's notifications sometimes arrive 4-8s after the
                    # write; shorter timeouts just give up before the reply.
 
+# Hold the link without hammering the proxy. The Activate firmware idle-drops
+# the BLE link after ~36s of no GATT activity; a lightweight keepalive just
+# inside that window keeps the connection up so we avoid the connect/op/drop
+# churn that saturates a shared BT proxy. Fires only when no real op has run
+# recently, so it adds zero load while the coordinator is actively polling.
+KEEPALIVE_INTERVAL = 22.0  # seconds (< ~36s firmware idle-drop)
+
 
 class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """One-connection-per-device coordinator."""
@@ -90,6 +98,8 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._response_event: asyncio.Event = asyncio.Event()
         self._last_frame: Any = None
         self._unsub_bt_callback = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._last_op: float = 0.0  # monotonic ts of last successful round-trip
         # Cached state pushed to entities (see AB_2B_DECODE.md).
         # outlet1_on / outlet2_on / outlet0_on are booleans driven by the
         # bit-packed outlet_state byte in payload[13]. flow_lpm is what we'll
@@ -124,11 +134,18 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         # Schedule first refresh in the background
         self.hass.async_create_task(self.async_config_entry_first_refresh())
+        # Keepalive: hold the link inside the firmware's idle-drop window.
+        self._heartbeat_task = self.hass.async_create_background_task(
+            self._heartbeat(), name=f"{DOMAIN}_keepalive[{self.address}]"
+        )
 
     async def async_close(self) -> None:
         if self._unsub_bt_callback is not None:
             self._unsub_bt_callback()
             self._unsub_bt_callback = None
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         await self._disconnect()
 
     # ---- BT callbacks -------------------------------------------------------
@@ -178,26 +195,41 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # 1-2s on every reconnect when the proxy is still bonded.
         try:
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
-            self._client = client
-            return client
+            if await self._verify_link(client):
+                self._client = client
+                return client
+            # start_notify "succeeded" but the link is not actually usable
+            # (CCCD subscribe can return OK on a stale/half-broken bond while
+            # encrypted GATT ops still fail). Fall through to pair() recovery.
+            _LOGGER.warning("CCCD subscribe OK but link verify failed — running pair() recovery")
         except Exception as exc:  # noqa: BLE001
             if "Insufficient authentication" not in str(exc):
                 raise
+            _LOGGER.warning("CCCD auth fail — running pair() recovery")
 
-        _LOGGER.warning("CCCD auth fail — running pair() recovery")
         try:
             await client.pair()
             await asyncio.sleep(0.5)
         except Exception as pexc:  # noqa: BLE001
             _LOGGER.warning("pair() during recovery raised: %s", pexc)
 
+        verify_failed = False
         try:
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
-            self._client = client
-            return client
+            if await self._verify_link(client):
+                self._client = client
+                return client
+            verify_failed = True
         except Exception as exc2:  # noqa: BLE001
             if "Insufficient authentication" not in str(exc2) or not retry_after_clear:
                 raise
+
+        if verify_failed and not retry_after_clear:
+            # Recursion already bounded — don't loop again; surface a failure
+            # rather than handing back a known-broken session.
+            raise UpdateFailed(
+                f"BLE link to {self.address} unusable after bond-cache clear"
+            )
 
         _LOGGER.warning("Still auth=5 after re-pair — clearing proxy bond cache")
         await self._clear_cache_via_client(client)
@@ -209,22 +241,79 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await asyncio.sleep(2.0)
         return await self._connect_and_bond(retry_after_clear=False)
 
+    async def _verify_link(self, client: BleakClient) -> bool:
+        """Confirm the BLE link is actually usable after start_notify.
+
+        start_notify (a CCCD subscribe) can return OK on a stale/half-broken
+        bond while encrypted GATT ops still fail. We probe with a real op that
+        surfaces the auth error: a *write-with-response* of the benign 0x2B
+        unit-prime query to WRITE_CHAR_UUID (267f0002). That char has the Write
+        property (so a Write Request is accepted) and an awaited write WILL
+        surface "Insufficient authentication/authorization" on a broken bond.
+        NB: a read of the notify char (267f0003, Notify-only / no Read property)
+        or a response=False write would NOT reliably surface it — both look
+        "successful" on a dead link, making the verify a no-op.
+
+        Returns True if usable, False on the known auth-fail broken-bond case
+        (caller escalates to pair()/cache-clear). Other errors are treated as
+        usable (don't escalate on transient noise).
+        """
+        try:
+            await client.write_gatt_char(
+                WRITE_CHAR_UUID, frame_unit_prime(), response=True
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "Insufficient authentication" in msg or "Insufficient authorization" in msg:
+                _LOGGER.warning("link verify probe hit auth fail (broken bond): %s", exc)
+                return False
+            _LOGGER.debug("link verify probe raised (non-auth, treated as usable): %s", exc)
+            return True
+
+    def _proxy_api_client(self, client: BleakClient):
+        """Reach the underlying aioesphomeapi APIClient via the bleak-esphome
+        backend (client._backend._client and friends). None if not found."""
+        backend = getattr(client, "_backend", None)
+        for attr in ("_client", "client", "api", "_api_client"):
+            if backend is not None and getattr(backend, attr, None) is not None:
+                return getattr(backend, attr)
+        return None
+
+    async def _heartbeat(self) -> None:
+        """Hold the BLE link inside the firmware's ~36s idle-drop window.
+
+        Sends a cheap 0x2B read only when no real op has run for
+        KEEPALIVE_INTERVAL and we look connected — so during normal polling it
+        never fires and adds no proxy load; across idle gaps it holds the link
+        so we stop paying a full reconnect (and the proxy churn) every cycle."""
+        try:
+            while True:
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                if self._client is None or not self._client.is_connected:
+                    continue
+                if (monotonic() - self._last_op) < KEEPALIVE_INTERVAL:
+                    continue
+                try:
+                    await self._request(frame_unit_prime())
+                    _LOGGER.debug("keepalive ping ok for %s", self.address)
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "keepalive ping failed for %s: %s", self.address, exc
+                    )
+        except asyncio.CancelledError:
+            pass
+
     async def _clear_cache_via_client(self, client: BleakClient) -> None:
         """Clear the bond cache + unpair on the proxy currently servicing this
         client. We reach the underlying aioesphomeapi APIClient through the
         bleak-esphome backend."""
         addr_int = int(self.address.replace(":", ""), 16)
-        # Try multiple known attribute paths to find the APIClient.
-        api = None
-        backend = getattr(client, "_backend", None)
-        for attr in ("_client", "client", "api", "_api_client"):
-            if backend is not None and getattr(backend, attr, None) is not None:
-                api = getattr(backend, attr)
-                _LOGGER.warning("reached proxy APIClient via client._backend.%s (%s)", attr, type(api).__name__)
-                break
+        api = self._proxy_api_client(client)
         if api is None:
-            _LOGGER.warning("could not reach proxy APIClient — backend=%r attrs=%s", backend, dir(backend) if backend else "no backend")
+            _LOGGER.warning("could not reach proxy APIClient")
             return
+        _LOGGER.warning("reached proxy APIClient (%s)", type(api).__name__)
         for op_name, op_call in (
             ("unpair",      lambda: api.bluetooth_device_unpair(addr_int)),
             ("clear_cache", lambda: api.bluetooth_device_clear_cache(addr_int)),
@@ -284,6 +373,9 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed(
                     f"timeout waiting for response to {frame.hex()}"
                 ) from e
+            # A real round-trip completed — record it so the keepalive
+            # heartbeat knows the link is held and need not ping.
+            self._last_op = monotonic()
             return self._last_frame
 
     # ---- Coordinator update loop -------------------------------------------
