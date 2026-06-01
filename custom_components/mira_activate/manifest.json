@@ -2,18 +2,23 @@
   "domain": "mira_activate",
   "name": "Mira Activate Shower",
   "version": "0.1.1",
-  "codeowners": ["@jonwilliams84"],
+  "codeowners": [
+    "@jonwilliams84"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/jonwilliams84/Mira-Activate-HA",
   "issue_tracker": "https://github.com/jonwilliams84/Mira-Activate-HA/issues",
   "iot_class": "local_polling",
-  "dependencies": ["bluetooth"],
+  "dependencies": [
+    "bluetooth"
+  ],
   "requirements": [
     "bleak>=0.21.0",
     "bleak-retry-connector>=3.5.0"
   ],
   "bluetooth": [
     {
+      "local_name": "Mira*",
       "service_uuid": "267f0001-eb15-43f5-94c3-67d2221188f7"
     }
   ]
