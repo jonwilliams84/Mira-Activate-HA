@@ -18,7 +18,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS
 
-from .mira_protocol import SERVICE_UUID
+from .mira_protocol import SERVICE_UUID, device_id_from_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,8 +39,16 @@ class MiraActivateConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Triggered automatically by HA when an Activate is advertising."""
         _LOGGER.debug("BT discovered %s (%s)", discovery_info.address, discovery_info.name)
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
+        # Identity = the stable name-id ('MIRA <hex> ...'), NOT the BLE address.
+        # The Activate regenerates its random address (e.g. on power-cycle); keying
+        # on the address makes each regeneration look like a brand-new device. If
+        # we already know this unit, just refresh its stored address (the entry
+        # reloads) instead of offering a duplicate.
+        dev_id = device_id_from_name(discovery_info.name)
+        await self.async_set_unique_id(dev_id or discovery_info.address)
+        self._abort_if_unique_id_configured(
+            updates={CONF_ADDRESS: discovery_info.address}
+        )
         self._discovery_info = discovery_info
         self.context["title_placeholders"] = {
             "name": discovery_info.name or f"Mira Activate {discovery_info.address[-5:]}"
@@ -56,7 +64,11 @@ class MiraActivateConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(
                 title=self._discovery_info.name
                 or f"Mira Activate {self._discovery_info.address[-5:]}",
-                data={CONF_ADDRESS: self._discovery_info.address},
+                data={
+                    CONF_ADDRESS: self._discovery_info.address,
+                    "name": self._discovery_info.name,
+                    "device_id": device_id_from_name(self._discovery_info.name),
+                },
             )
         return self.async_show_form(
             step_id="bluetooth_confirm",
@@ -72,22 +84,30 @@ class MiraActivateConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
-            await self.async_set_unique_id(address)
-            self._abort_if_unique_id_configured()
             name = self._discovered_devices.get(address, address)
+            dev_id = device_id_from_name(name)
+            await self.async_set_unique_id(dev_id or address)
+            self._abort_if_unique_id_configured(updates={CONF_ADDRESS: address})
             return self.async_create_entry(
-                title=name, data={CONF_ADDRESS: address}
+                title=name,
+                data={
+                    CONF_ADDRESS: address,
+                    "name": name,
+                    "device_id": dev_id,
+                },
             )
 
-        # Re-scan the HA BT cache. SERVICE_UUID first so the name check only runs
-        # on our devices, and guard a None/empty name (nameless beacons nearby
-        # would otherwise crash .startswith).
+        # Re-scan the HA BT cache. SERVICE_UUID first, guard a None/empty name,
+        # and dedupe on the stable name-id (the address may differ from when it
+        # was added — the Activate regenerates its random address).
+        configured = self._async_current_ids()
         for info in async_discovered_service_info(self.hass):
             if SERVICE_UUID not in info.service_uuids:
                 continue
             if not (info.name or "").startswith("Mira"):
                 continue
-            if info.address not in self._async_current_ids():
+            uid = device_id_from_name(info.name) or info.address
+            if uid not in configured:
                 self._discovered_devices[info.address] = (
                     info.name or f"Mira Activate {info.address[-5:]}"
                 )
