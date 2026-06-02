@@ -79,12 +79,15 @@ class MiraActivateConfigFlow(ConfigFlow, domain=DOMAIN):
                 title=name, data={CONF_ADDRESS: address}
             )
 
-        # Re-scan: take everything currently in the HA BT cache that matches our svc
+        # Re-scan the HA BT cache. SERVICE_UUID first so the name check only runs
+        # on our devices, and guard a None/empty name (nameless beacons nearby
+        # would otherwise crash .startswith).
         for info in async_discovered_service_info(self.hass):
-            if not info.name.startswith("Mira"):
+            if SERVICE_UUID not in info.service_uuids:
                 continue
-
-            if SERVICE_UUID in info.service_uuids and info.address not in self._async_current_ids():
+            if not (info.name or "").startswith("Mira"):
+                continue
+            if info.address not in self._async_current_ids():
                 self._discovered_devices[info.address] = (
                     info.name or f"Mira Activate {info.address[-5:]}"
                 )
