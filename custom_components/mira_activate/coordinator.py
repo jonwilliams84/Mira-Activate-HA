@@ -378,8 +378,20 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ---- Op primitives ------------------------------------------------------
 
-    async def _request(self, frame: bytes) -> Any:
-        """Send a frame and await one response. Serialized via _lock."""
+    async def _request(self, frame: bytes, *, wait_response: bool = True) -> Any:
+        """Send a frame; optionally await one response. Serialized via _lock.
+
+        ``wait_response=True`` (the poll path) blocks up to ``OP_TIMEOUT`` for
+        the device's reply notification and returns the parsed frame.
+
+        ``wait_response=False`` (the user-command path) is fire-and-return: it
+        writes the ATT Write Command and releases immediately. The water reacts
+        on the write itself — the reply notification is only an app-level "got
+        it" ack — so making a user command wait up to 10s for that ack (and hold
+        the lock the whole time) is the bulk of the "shower takes a minute to
+        turn on" lag. The sibling ``mira_mode`` integration fires-and-returns
+        and is instant; this matches it. State catches up on the next poll.
+        """
         async with self._lock:
             client = await self._ensure_connected()
             self._assembler.reset()
@@ -392,6 +404,10 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await client.write_gatt_char(
                 WRITE_CHAR_UUID, frame, response=False
             )
+            # Link held — record so the keepalive heartbeat need not ping.
+            self._last_op = monotonic()
+            if not wait_response:
+                return None
             try:
                 await asyncio.wait_for(
                     self._response_event.wait(), timeout=OP_TIMEOUT
@@ -400,9 +416,6 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed(
                     f"timeout waiting for response to {frame.hex()}"
                 ) from e
-            # A real round-trip completed — record it so the keepalive
-            # heartbeat knows the link is held and need not ping.
-            self._last_op = monotonic()
             return self._last_frame
 
     # ---- Coordinator update loop -------------------------------------------
@@ -560,10 +573,11 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             flags=1, temp_x10=0, flow_x4=0, outlet_state=0
         )
         try:
-            await self._request(frame)
+            await self._request(frame, wait_response=False)
         except UpdateFailed as e:
             _LOGGER.error("turn-off-all failed: %s", e)
             raise
+        self.hass.async_create_task(self.async_request_refresh())
 
     async def _send_temperature_frame(self) -> None:
         """Build and send a 0xAB frame from the cached desired state.
@@ -593,7 +607,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             flow_x4=flow_x4,
             outlet_state=outlet_state,
         )
-        _LOGGER.warning(
+        _LOGGER.debug(
             "0xAB → flags=0 temp_x10=%d flow_x4=%d outlet_state=0x%02x "
             "frame=%s",
             temp_x10,
@@ -602,7 +616,11 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             frame.hex(),
         )
         try:
-            await self._request(frame)
+            # Fire-and-return so the command lands fast (no 10s ack wait).
+            await self._request(frame, wait_response=False)
         except UpdateFailed as e:
             _LOGGER.error("set-temperature failed: %s", e)
             raise
+        # Pull fresh state in the background so HA reflects the change without
+        # making the user wait on it.
+        self.hass.async_create_task(self.async_request_refresh())
