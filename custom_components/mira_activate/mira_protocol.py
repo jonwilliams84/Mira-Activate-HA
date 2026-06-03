@@ -21,6 +21,22 @@ SERVICE_UUID = "267f0001-eb15-43f5-94c3-67d2221188f7"
 WRITE_CHAR_UUID = "267f0002-eb15-43f5-94c3-67d2221188f7"
 NOTIFY_CHAR_UUID = "267f0003-eb15-43f5-94c3-67d2221188f7"
 
+
+def device_id_from_name(name: str | None) -> str | None:
+    """Stable per-unit id from the advertised local name 'MIRA <hex> <ROOM>'.
+
+    The Activate uses a random BLE address that it regenerates (e.g. on a
+    power-cycle), so the address can't be a stable identity. The <hex> token in
+    the advertised name is fixed per unit, so we key on that instead. Returns
+    None if the name doesn't match (caller falls back to the BLE address).
+    """
+    if not name:
+        return None
+    parts = name.split()
+    if len(parts) >= 2 and parts[0].upper() == "MIRA":
+        return parts[1].upper()
+    return None
+
 # Frame constants
 SYNC = bytes([0xAA, 0x55, 0x00])
 SYNC_LEN = 3
