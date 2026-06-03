@@ -204,7 +204,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device = await self._get_ble_device()
         if device is None:
             raise UpdateFailed(f"Device {self.address} not in BT registry")
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Establishing BLE connection to %s (retry_after_clear=%s)",
             self.address, retry_after_clear,
         )
@@ -352,7 +352,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("proxy %s raised: %s: %s", op_name, type(exc).__name__, exc)
 
     def _on_disconnected(self, client: BleakClient) -> None:
-        _LOGGER.warning("BLE disconnect from %s", self.address)
+        _LOGGER.debug("BLE disconnect from %s", self.address)
         self._client = None
         self._state["available"] = False
 
@@ -427,7 +427,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # available: prefer parsed session_ready (bit 6 of byte 0);
                 # fall back to "we got a valid response at all".
                 self._state["available"] = True
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "0x2B ← %s : target=%.1f°C flow=%dLPM outlet=0x%02x "
                     "running=%s paused=%s error=%s session_ready=%s "
                     "iot=0x%02x measured=%.1f",
