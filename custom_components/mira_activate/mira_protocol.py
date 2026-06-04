@@ -23,18 +23,29 @@ NOTIFY_CHAR_UUID = "267f0003-eb15-43f5-94c3-67d2221188f7"
 
 
 def device_id_from_name(name: str | None) -> str | None:
-    """Stable per-unit id from the advertised local name 'MIRA <hex> <ROOM>'.
+    """Stable per-unit id from the advertised local name.
 
     The Activate uses a random BLE address that it regenerates (e.g. on a
-    power-cycle), so the address can't be a stable identity. The <hex> token in
-    the advertised name is fixed per unit, so we key on that instead. Returns
-    None if the name doesn't match (caller falls back to the BLE address).
+    power-cycle), so the address can't be a stable identity. We key on the
+    first token after "MIRA" instead — but the unit advertises under more than
+    one local-name form, and they MUST collapse to the same id or HA discovery
+    treats each form as a brand-new device:
+
+      - firmware default:  "Mira 003F#0203090622105802"  (model#serial)
+      - user-set name:     "Mira 003F en suite"
+
+    Only the part before the '#' (the model code, "003F") is present in every
+    form, so we truncate there. Single-unit assumption: two Activates sharing a
+    model code would collide — acceptable for a per-home install, and the only
+    token recoverable once a unit is renamed in the Mira app.
+
+    Returns None if the name doesn't match (caller falls back to the address).
     """
     if not name:
         return None
     parts = name.split()
     if len(parts) >= 2 and parts[0].upper() == "MIRA":
-        return parts[1].upper()
+        return parts[1].upper().split("#", 1)[0]
     return None
 
 # Frame constants

@@ -23,8 +23,9 @@ the HA host required.
 - **State sensors** — measured water temp, target temp, current flow, raw
   outlet/status bytes for automation use
 - **Binary sensors** — Running, Paused, Error, Session Ready
-- **Resilient session** — automatic LE re-bond on auth failure, proxy bond
-  cache cleared when stale, per-entity optimistic state so toggles feel
+- **Resilient session** — automatic LE re-bond on auth failure, with the bond
+  cache cleared across *all* BT proxies (proxies don't share bonds), poll
+  backoff on a flaky link, and per-entity optimistic state so toggles feel
   instant in HA
 
 ## Supported Devices
@@ -96,6 +97,25 @@ The Activate uses a fully different wire format from Mira Mode:
 The integration was reverse-engineered from the official `uk.co.mirashowers`
 Android app combined with a live HCI snoop capture of the app driving the
 shower. Detailed protocol writeup: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+## Troubleshooting
+
+**A duplicate device keeps being "discovered."**
+Fixed in 0.1.6. The Activate advertises under two name forms and older builds
+keyed identity on each separately, so an address rotation looked like a new
+unit. Update, restart HA, and it stops; any leftover duplicate device can be
+deleted from its device page.
+
+**`CCCD ... Insufficient authorization`, or the shower drops to unavailable.**
+The Activate needs a bonded (encrypted) link to receive notifications. If the
+connection is routed through an ESPHome proxy that doesn't hold the bond — or
+the BLE address has rotated — you get auth failures. 0.1.6 clears the bond
+across *all* proxies during recovery and backs off instead of hammering. If it
+still recurs, it's almost always **marginal RF**: connections drop mid-pairing
+(`error 22`). The durable fix is a single well-placed proxy near the shower with
+`bluetooth_proxy: active: true`, and active connections disabled on distant
+competitors, so the shower always connects via the one proxy holding its bond
+over a strong link.
 
 ## Status
 
