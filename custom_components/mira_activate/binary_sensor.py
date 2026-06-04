@@ -73,7 +73,7 @@ class MiraBinarySensor(
     def __init__(self, coord: MiraActivateCoordinator, desc: MiraBinaryDesc) -> None:
         super().__init__(coord)
         self.entity_description = desc
-        self._attr_unique_id = f"{coord.address}_{desc.key}"
+        self._attr_unique_id = f"{coord.unique_base}_{desc.key}"
         self._attr_device_info = coord.device_info
 
     @property
