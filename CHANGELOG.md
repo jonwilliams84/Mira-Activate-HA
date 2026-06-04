@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.7] - 2026-06-04
+
+### Fixed
+- **Reverted the 0.1.6 "clear bond across all proxies" recovery step — it
+  stranded the unit.** The SMP bond is precious and the Activate rejects a
+  fresh `pair()` on demand (`error 82`), so wiping the working bond on every
+  proxy left the device unable to re-bond and stuck on CCCD `Insufficient
+  authorization`. Recovery again clears the bond cache on the *connected*
+  proxy only. The genuinely useful 0.1.6 changes (duplicate-discovery fix,
+  identity self-heal, entity-uid stabilisation, poll backoff) are unaffected.
+
 ## [0.1.6] - 2026-06-04
 
 ### Fixed

@@ -276,9 +276,6 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:  # noqa: BLE001
             pass
         self._client = None
-        # The bond may be stale on a *different* proxy than this one — clear it
-        # everywhere so the fresh reconnect can re-bond on whichever proxy wins.
-        await self._clear_bonds_all_proxies()
         await asyncio.sleep(2.0)
         return await self._connect_and_bond(retry_after_clear=False)
 
@@ -364,68 +361,6 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("proxy %s OK for %s", op_name, self.address)
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("proxy %s raised: %s: %s", op_name, type(exc).__name__, exc)
-
-    def _all_proxy_api_clients(self) -> list[tuple[str, Any]]:
-        """Every ESPHome *bluetooth-proxy* APIClient HA currently knows about.
-
-        Proxies don't share bonds: a bond made via proxy A is invisible to
-        proxy B, so a connection routed through B fails with auth errors that
-        clearing only the *connected* proxy can't fix.
-
-        We reach each esphome config entry's runtime data defensively (its
-        location has moved across HA versions) and keep ONLY entries whose
-        device advertises the bluetooth-proxy feature — every esphome APIClient
-        exposes ``bluetooth_device_unpair``, but calling it on a non-proxy node
-        just blocks until timeout, so the feature flag is the real filter."""
-        clients: list[tuple[str, Any]] = []
-        for entry in self.hass.config_entries.async_entries("esphome"):
-            rd = getattr(entry, "runtime_data", None)
-            if rd is None:
-                rd = self.hass.data.get("esphome", {}).get(entry.entry_id)
-            if rd is None:
-                continue
-            api = getattr(rd, "client", None)
-            if api is None or not hasattr(api, "bluetooth_device_unpair"):
-                continue
-            di = getattr(rd, "device_info", None)
-            flags = 0
-            if di is not None:
-                flags = getattr(di, "bluetooth_proxy_feature_flags", 0) or getattr(
-                    di, "bluetooth_proxy_feature_flags_compat", 0
-                )
-            if flags:
-                clients.append((entry.title or entry.entry_id, api))
-        return clients
-
-    async def _clear_bonds_all_proxies(self) -> None:
-        """Unpair + clear this device's bond on EVERY proxy, not just the one
-        we happened to connect through. Best-effort and concurrent: a proxy that
-        never bonded the device just errors harmlessly, and the whole sweep is
-        bounded to one short timeout regardless of how many proxies exist."""
-        addr_int = int(self.address.replace(":", ""), 16)
-        proxies = self._all_proxy_api_clients()
-        if not proxies:
-            _LOGGER.debug("no esphome BT proxies found for bond clear")
-            return
-        _LOGGER.warning(
-            "clearing %s bonds across %d proxies", self.address, len(proxies)
-        )
-
-        async def _clear_one(title: str, api: Any) -> None:
-            for op_name, op_call in (
-                ("unpair",      lambda: api.bluetooth_device_unpair(addr_int)),
-                ("clear_cache", lambda: api.bluetooth_device_clear_cache(addr_int)),
-            ):
-                try:
-                    await asyncio.wait_for(op_call(), timeout=5)
-                    _LOGGER.debug("proxy %s %s OK for %s", title, op_name, self.address)
-                except Exception as exc:  # noqa: BLE001
-                    _LOGGER.debug("proxy %s %s raised: %s", title, op_name, exc)
-
-        await asyncio.gather(
-            *(_clear_one(title, api) for title, api in proxies),
-            return_exceptions=True,
-        )
 
     def _note_failure(self) -> None:
         """Grow the poll interval on consecutive failures (capped)."""
