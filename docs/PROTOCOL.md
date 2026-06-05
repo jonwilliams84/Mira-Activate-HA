@@ -33,8 +33,14 @@ Within the Mira service:
 | `267f0003-…` | Notify (+ CCCD `0x2902`) | Responses + asynchronous status |
 
 The device advertises a local name of the form `MIRA <hex> <ROOM>` (e.g.
-`MIRA 003F ENSUITE`). It uses a non-resolvable random address that does
-not rotate.
+`MIRA 003F ENSUITE`). It uses a static random address that is stable while
+powered, but the device **regenerates it on a power-cycle** (and the unit also
+advertises under two name forms — the firmware `Mira <model>#<serial>` and the
+user-set room name). Identity must therefore key on the stable model id parsed
+from the name (`device_id_from_name` → e.g. `003F`), never the BLE address;
+otherwise every power-cycle or name form looks like a brand-new device. The
+integration follows the address rotation by re-resolving the current address
+for that name id.
 
 ## 2. Wire framing
 
@@ -81,16 +87,58 @@ The official app's flow from `connectGatt(...)` to the first useful read:
 
 Without the bond, the device returns GATT error `5` (Insufficient
 authentication) on *any* write — including the CCCD descriptor — and
-drops the link. With the bond in place, writes are accepted by the device
-without any further app-level handshake.
+drops the link.
 
-The official app fires `requestConnectionPriority(HIGH)` immediately
-after bonding. Over a 2.4 GHz noisy ESPHome BT proxy link, mirroring
-that with `bluetooth_device_set_connection_params(min=6, max=10,
-latency=0, timeout=400)` breaks things — `timeout=400` is a 4 s
-supervision timeout, shorter than the device's natural ~30 s response
-cadence, so the link drops on every poll. Leave conn params at the
-proxy's defaults.
+### 3.1 Bonding over an ESPHome proxy — the part that bit us
+
+The single most important, hard-won finding (it cost a full debugging session
+and contradicts what an earlier draft of this doc claimed):
+
+> **On a fresh connection through an ESPHome Bluetooth proxy, the stored SMP
+> bond is _not_ applied automatically. The proxy connects unencrypted, and the
+> CCCD subscribe then fails with GATT error 5 — even though a valid bond exists
+> in the proxy's NVS. You must call `pair()` (→ `aioesphomeapi
+> bluetooth_device_pair`) _before_ the CCCD subscribe on _every_ connect to
+> re-arm encryption from the stored key.**
+
+This is why the official app appears to "just ride the bond": the phone's own
+BLE stack keeps the LE encryption active on its single held link. A proxy makes
+a brand-new GATT connection each time, and each one needs encryption
+re-triggered. So:
+
+- **Creating the bond** (first ever pair, or after it's lost): the device must be
+  in **pairing mode** — put it there at the panel or power-cycle it. A
+  central-initiated `createBond` / `bluetooth_device_pair` while it is *not*
+  pairable is rejected with **error 82**. This is the only step that needs user
+  action, and it's what the integration's config-flow `pair_confirm` step drives.
+- **Activating an existing bond** (every reconnect): `pair()` with the cached
+  LTK present just starts encryption — it does **not** re-bond, need pairing
+  mode, or prompt anything. Cheap and silent. Do it on every connect.
+
+The bond is **per-proxy**: it lives in the NVS of whichever proxy performed the
+pairing. ESPHome proxies do not share bonds, so all connections to the Activate
+must be routed through that one bonded proxy. (Most peripherals, the Activate
+included, also store only one bond, so pairing a second proxy would evict the
+first — don't run two *active* proxies for one Activate; scan-only proxies are
+fine.)
+
+### 3.2 What the HCI capture actually proves (and doesn't)
+
+The capture analysed for this work was **steady-state** — the connection was
+already up and encrypted, and the snoop ring had wrapped past the original
+pairing. So it contains **no SMP packets and no Encryption-Change events**: the
+Just-Works / no-MITM nature of the bond is **inferred from the APK** (it calls
+only `createBond()`, has no passkey/IO-capability code, and the device is
+display-less), **not wire-proven**. What the wire *does* prove is the
+connection-management shape, which drove the tuning in §7:
+
+- The app holds **one persistent connection** for the whole session; it never
+  reconnects per command.
+- It modulates the **connection interval**: ~4 s when idle, **15 ms** when
+  actively talking (via `requestConnectionPriority(HIGH)`). At 15 ms,
+  write→notify round-trips are 24–65 ms. The "multi-second" feel comes only from
+  a request landing during the 4 s idle window.
+- No MTU exchange; no reads of Generic Access/Attribute characteristics.
 
 ## 4. Control: opcode `0xAB` (Set Temperature / Operate)
 
@@ -210,13 +258,27 @@ has examples.
 A correct minimal driver only needs the two opcodes above plus the bond
 flow. Things that cost time during development and are worth knowing:
 
-- **Don't request aggressive `bluetooth_device_set_connection_params`**.
-  Anything with `supervision_timeout < 5 s` makes the link drop on every
-  poll cycle. The proxy's default conn params work; leave them alone.
-- **Skip `client.pair()` on the happy path**. Mira's bond persists on the
-  proxy side; calling `pair()` every reconnect costs 1–2 s. Try the
-  CCCD descriptor write first; only run a full pair flow if it returns
-  GATT error 5 (Insufficient authentication).
+- **`pair()` on _every_ connect, before the CCCD subscribe** — see §3.1. The
+  cached bond is dormant on a fresh proxy connection; `pair()` re-arms encryption
+  and is cheap/silent when the bond already exists. (An earlier version of this
+  doc said the opposite; that was the single biggest time-sink.) Make it
+  tolerant: if it raises, still attempt the CCCD subscribe — the subscribe
+  succeeding is the real proof the bond is live.
+- **Set a _long_ supervision timeout, not the proxy default.** The Activate
+  stalls (>10 s with no `0x2B` reply) when idle; a short supervision timeout
+  (the old `400` = 4 s, and arguably the proxy default) tears the link down
+  mid-stall. We pin `min=24, max=60, latency=0, timeout=2000` (30–75 ms interval,
+  20 s supervision). Do **not** pin the app's 15 ms interval over a proxy — it
+  overloads a radio shared with other devices/scanning and destabilises the link
+  for no real gain (a fire-and-return write goes out within one interval anyway).
+- **Keep the link alive with a frequent-check keepalive.** The firmware idle-
+  drops after ~36 s. Check every ~5 s and send a fire-and-forget `0x2B` once the
+  link has been idle ~20 s. A keepalive that *sleeps* a fixed ~20 s between checks
+  will miss the window (a check landing just under the threshold pushes the next
+  one past 36 s) and the link drops.
+- **Reconnect eagerly on an unexpected drop** rather than waiting out the poll
+  backoff — the device/proxy will drop the link occasionally no matter what, so
+  make the drop invisible (~2 s back) instead of trying to eliminate it.
 - **`outlets = 0x04` does nothing**. Bit 2 is not a valid outlet bit and
   sending it makes the device ignore the whole write. Use bits 0/1 only.
 - **Echo the device's `flow` byte back on writes** unless the user has
@@ -224,13 +286,14 @@ flow. Things that cost time during development and are worth knowing:
   from the last 0x2B response` whenever it's just adjusting temperature.
 - **Notifications can arrive 4–8 s after the write**. Don't set the per-op
   timeout below 10 s or you'll false-negative successful writes.
-- **Polling cadence has a hard ceiling around 10 s over a BT proxy.** The
-  device only responds to `0x2B` reliably in ~30 s windows, and faster
-  polls just time out in the gaps without changing perceived
-  responsiveness. The integration uses 10 s poll, 10 s op timeout. Panel-
-  side state changes reflect within 10–30 s; HA-initiated changes use
-  per-entity optimistic state and feel instantaneous in the UI even
-  though the BLE write is still a few seconds out.
+- **Poll no faster than the `0x2B` round-trip.** The reply takes ~6 s, so a poll
+  interval ≤ the round-trip makes successive polls overlap and cancel each other
+  (`CancelledError`, which then drops the link). The integration uses a 25 s poll
+  with a 10 s op timeout.
+- **Use optimistic state for HA-initiated changes.** The `0x2B` confirm is
+  several seconds out, so push the commanded value to the entities the instant
+  the write is sent and reconcile on the next poll — otherwise every button press
+  appears to lag by seconds. Panel-side changes still reflect within a poll cycle.
 
 ## 8. Reproducing the capture
 

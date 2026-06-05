@@ -34,6 +34,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -62,8 +63,13 @@ DOMAIN = "mira_activate"
 # 30s — Mode integration's setting. The Activate drops the BLE link after
 # ~36s idle, so each poll usually triggers a reconnect. The actual
 # responsiveness floor is dominated by reconnect time, not poll cadence.
-POLL_INTERVAL = timedelta(seconds=10)  # was 30 — trade BT load for faster
-                                       # detection of panel-side state changes
+POLL_INTERVAL = timedelta(seconds=25)  # the 0x2B response takes ~6s, so a 10s
+                                       # interval made polls pile up (the next
+                                       # one cancelling the in-flight one →
+                                       # CancelledError drops). 25s > one poll's
+                                       # round-trip, so polls never overlap and
+                                       # the lock is free for user commands far
+                                       # more of the time.
 OP_TIMEOUT = 10.0  # Activate's notifications sometimes arrive 4-8s after the
                    # write; shorter timeouts just give up before the reply.
 
@@ -72,13 +78,41 @@ OP_TIMEOUT = 10.0  # Activate's notifications sometimes arrive 4-8s after the
 # inside that window keeps the connection up so we avoid the connect/op/drop
 # churn that saturates a shared BT proxy. Fires only when no real op has run
 # recently, so it adds zero load while the coordinator is actively polling.
-KEEPALIVE_INTERVAL = 22.0  # seconds (< ~36s firmware idle-drop)
+KEEPALIVE_INTERVAL = 20.0  # ping once the link is idle this long (< ~36s drop)
+HEARTBEAT_CHECK = 5.0      # how often the heartbeat re-checks idle time; small
+                           # so the ping reliably lands inside the drop window
+
+# Connection-interval control (proxy-side, via ESPHome's
+# bluetooth_device_set_connection_params — needs proxy firmware ≥ 2025.x with
+# the CONNECTION_PARAMS_SETTING feature flag; older firmware no-ops with a
+# warning). Units are 1.25ms. The official app's HCI capture shows it bumps the
+# link to a 15ms interval whenever it needs to talk and lets it relax to ~4s
+# idle otherwise; round-trips at 15ms are 24-65ms vs multi-second when the poll
+# lands during the idle window. We hold a single persistent connection (like the
+# app) and pin it to a tight interval so every poll AND every user command lands
+# fast, instead of paying a reconnect + idle-interval penalty per poll.
+# NB: a tight 15ms interval looked good in the app's HCI capture, but the app
+# owns the phone's radio. Pinning 15ms on a proxy that ALSO serves the Mira Mode
+# unit + presence scanning overloads the shared radio and trips the (short)
+# supervision timeout → periodic link drops → slow reconnects → the minute-long
+# command latency. For a fire-and-return command the write goes out within ONE
+# connection interval anyway, so 30-75ms is imperceptible while being far gentler
+# on the shared proxy. Stability (link stays UP) beats raw interval for perceived
+# responsiveness — a held link makes every command instant.
+FAST_MIN_INTERVAL = 24   # 30.0 ms
+FAST_MAX_INTERVAL = 60   # 75.0 ms  (gives the shared proxy real slack)
+CONN_LATENCY = 0
+CONN_TIMEOUT = 2000      # 20.0 s supervision. The Activate stalls (no 0x2B reply
+                         # for >10s) when idle; a short supervision timeout then
+                         # tears the link down mid-poll. A long one lets the link
+                         # ride out the stall instead of dropping + reconnecting.
 
 # When polls keep failing (marginal RF / broken bond), backing off stops the
 # 10s reconnect churn from hammering a struggling link and flooding the log.
 # Interval doubles per consecutive failure up to this cap, then resets on the
 # first good poll.
-BACKOFF_MAX = timedelta(seconds=120)
+BACKOFF_MAX = timedelta(seconds=30)  # a shower should recover fast; eager
+                                     # reconnect-on-drop is the primary path back
 
 
 class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -117,6 +151,9 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._heartbeat_task: asyncio.Task | None = None
         self._last_op: float = 0.0  # monotonic ts of last successful round-trip
         self._fail_count: int = 0   # consecutive poll failures (drives backoff)
+        self._auth_failing: bool = False  # last failure was CCCD auth (bond lost)
+        self._issue_raised: bool = False  # repair issue (bond lost) is showing
+        self._closing: bool = False  # set on async_close to stop eager reconnect
         # Cached state pushed to entities (see AB_2B_DECODE.md).
         # outlet1_on / outlet2_on / outlet0_on are booleans driven by the
         # bit-packed outlet_state byte in payload[13]. flow_lpm is what we'll
@@ -157,6 +194,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def async_close(self) -> None:
+        self._closing = True
         if self._unsub_bt_callback is not None:
             self._unsub_bt_callback()
             self._unsub_bt_callback = None
@@ -206,19 +244,37 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _ensure_connected(self) -> BleakClient:
         if self._client is not None and self._client.is_connected:
             return self._client
-        return await self._connect_and_bond(retry_after_clear=True)
+        return await self._connect()
 
-    async def _connect_and_bond(self, retry_after_clear: bool) -> BleakClient:
-        """Connect and enable notifications. If start_notify fails with
-        Insufficient authentication, run a pair() and retry; if still failing,
-        clear the proxy's bond cache and recurse once."""
+    async def _connect(self) -> BleakClient:
+        """Establish ONE persistent BLE connection and hold it.
+
+        The official app's HCI capture (CCCD_AUTH_RESOLVED.md) proves the app
+        holds a single connection for the whole session, subscribes CCCD once,
+        and never re-pairs or tears down on the hot path — it just rides the
+        existing LE bond that lives in the proxy/device. So this method:
+
+          1. connects,
+          2. pins a tight connection interval (proxy-side) so polls AND user
+             commands round-trip in tens of ms instead of waiting up to the
+             device's ~4s idle interval,
+          3. subscribes the notify CCCD,
+          4. hands back the client to be held until the link genuinely drops.
+
+        It deliberately does NOT run pair()/clear-cache recovery. That path
+        (the 0.1.6 regression, see CLAUDE.md) destroyed the precious SMP bond
+        and stranded the unit: the device rejects a fresh pair() on demand
+        (`error 82`), and clearing the proxy cache drops the link, so the
+        "recovery" only deepened the auth failure it was meant to fix. A real
+        Insufficient-authentication here means the bond is momentarily
+        unavailable (e.g. another proxy holds the connection slot, or the
+        device hasn't re-exposed the bond yet); the cure is to back off and
+        retry the *connection*, never to nuke the bond.
+        """
         device = await self._get_ble_device()
         if device is None:
             raise UpdateFailed(f"Device {self.address} not in BT registry")
-        _LOGGER.debug(
-            "Establishing BLE connection to %s (retry_after_clear=%s)",
-            self.address, retry_after_clear,
-        )
+        _LOGGER.debug("Establishing persistent BLE connection to %s", self.address)
         client = await establish_connection(
             BleakClientWithServiceCache,
             device,
@@ -229,85 +285,78 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._assembler.reset()
         self._response_event.clear()
 
-        # Fast path: try start_notify without an explicit pair() — saves
-        # 1-2s on every reconnect when the proxy is still bonded.
-        try:
-            await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
-            if await self._verify_link(client):
-                self._client = client
-                return client
-            # start_notify "succeeded" but the link is not actually usable
-            # (CCCD subscribe can return OK on a stale/half-broken bond while
-            # encrypted GATT ops still fail). Fall through to pair() recovery.
-            _LOGGER.warning("CCCD subscribe OK but link verify failed — running pair() recovery")
-        except Exception as exc:  # noqa: BLE001
-            if "Insufficient authentication" not in str(exc):
-                raise
-            _LOGGER.warning("CCCD auth fail — running pair() recovery")
+        # Pin a fast connection interval up front (the app's 15ms "active"
+        # state). Best-effort: no-ops cleanly on older proxy firmware.
+        await self._set_fast_connection_params(client)
 
+        # Activate the cached SMP bond on this fresh connection. Over an ESPHome
+        # proxy the stored LTK is NOT auto-applied on connect — without an
+        # explicit pair() the link stays unencrypted and the CCCD subscribe
+        # below returns Insufficient authentication. When the bond already
+        # exists this just (re)establishes encryption from the cached key: no
+        # re-bonding, no user action, no pairing mode needed (that's only
+        # required to create a bond in the first place, which the config flow's
+        # bonding.async_seed_bond handles). Tolerant — if it raises we still try
+        # start_notify, which is the real arbiter of whether the link is usable.
         try:
             await client.pair()
-            await asyncio.sleep(0.5)
-        except Exception as pexc:  # noqa: BLE001
-            _LOGGER.warning("pair() during recovery raised: %s", pexc)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("pair() on connect raised (continuing): %s", exc)
 
-        verify_failed = False
         try:
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
-            if await self._verify_link(client):
-                self._client = client
-                return client
-            verify_failed = True
-        except Exception as exc2:  # noqa: BLE001
-            if "Insufficient authentication" not in str(exc2) or not retry_after_clear:
-                raise
-
-        if verify_failed and not retry_after_clear:
-            # Recursion already bounded — don't loop again; surface a failure
-            # rather than handing back a known-broken session.
-            raise UpdateFailed(
-                f"BLE link to {self.address} unusable after bond-cache clear"
-            )
-
-        _LOGGER.warning("Still auth=5 after re-pair — clearing proxy bond cache")
-        await self._clear_cache_via_client(client)
-        try:
-            await client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
-        self._client = None
-        await asyncio.sleep(2.0)
-        return await self._connect_and_bond(retry_after_clear=False)
-
-    async def _verify_link(self, client: BleakClient) -> bool:
-        """Confirm the BLE link is actually usable after start_notify.
-
-        start_notify (a CCCD subscribe) can return OK on a stale/half-broken
-        bond while encrypted GATT ops still fail. We probe with a real op that
-        surfaces the auth error: a *write-with-response* of the benign 0x2B
-        unit-prime query to WRITE_CHAR_UUID (267f0002). That char has the Write
-        property (so a Write Request is accepted) and an awaited write WILL
-        surface "Insufficient authentication/authorization" on a broken bond.
-        NB: a read of the notify char (267f0003, Notify-only / no Read property)
-        or a response=False write would NOT reliably surface it — both look
-        "successful" on a dead link, making the verify a no-op.
-
-        Returns True if usable, False on the known auth-fail broken-bond case
-        (caller escalates to pair()/cache-clear). Other errors are treated as
-        usable (don't escalate on transient noise).
-        """
-        try:
-            await client.write_gatt_char(
-                WRITE_CHAR_UUID, frame_unit_prime(), response=True
-            )
-            return True
         except Exception as exc:  # noqa: BLE001
+            # CCCD subscribe failed. If it's an auth failure the bond is not
+            # currently usable on this connection — DO NOT pair()/clear-cache.
+            # Drop the client so the next poll reconnects (backoff handles the
+            # cadence); the bond is left intact for when it becomes available.
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
             msg = str(exc)
-            if "Insufficient authentication" in msg or "Insufficient authorization" in msg:
-                _LOGGER.warning("link verify probe hit auth fail (broken bond): %s", exc)
-                return False
-            _LOGGER.debug("link verify probe raised (non-auth, treated as usable): %s", exc)
-            return True
+            if (
+                "Insufficient authentication" in msg
+                or "Insufficient authorization" in msg
+            ):
+                self._auth_failing = True
+                raise UpdateFailed(
+                    f"CCCD auth not available for {self.address} "
+                    "(bond temporarily unusable — will retry, bond left intact)"
+                ) from exc
+            raise
+
+        self._auth_failing = False
+        self._client = client
+        self._last_op = monotonic()
+        _LOGGER.debug("BLE link to %s up + notify subscribed", self.address)
+        return client
+
+    async def _set_fast_connection_params(self, client: BleakClient) -> None:
+        """Pin a tight LE connection interval via the ESPHome proxy.
+
+        Mirrors the official app, which drives the link at a ~15ms interval
+        while it's talking (HCI capture). Reaches the bleak-esphome backend's
+        set_connection_params (proxy firmware ≥ ESPHome 2025.x with the
+        CONNECTION_PARAMS_SETTING flag; older firmware logs a warning and
+        no-ops). Best-effort — never fatal."""
+        backend = getattr(client, "_backend", None)
+        setter = getattr(backend, "set_connection_params", None)
+        if setter is None:
+            return
+        try:
+            await setter(
+                FAST_MIN_INTERVAL, FAST_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT
+            )
+            _LOGGER.debug(
+                "pinned fast conn params for %s (%.1f-%.1fms)",
+                self.address,
+                FAST_MIN_INTERVAL * 1.25,
+                FAST_MAX_INTERVAL * 1.25,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("set_connection_params best-effort failed: %s", exc)
 
     def _proxy_api_client(self, client: BleakClient):
         """Reach the underlying aioesphomeapi APIClient via the bleak-esphome
@@ -321,19 +370,26 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _heartbeat(self) -> None:
         """Hold the BLE link inside the firmware's ~36s idle-drop window.
 
-        Sends a cheap 0x2B read only when no real op has run for
-        KEEPALIVE_INTERVAL and we look connected — so during normal polling it
-        never fires and adds no proxy load; across idle gaps it holds the link
-        so we stop paying a full reconnect (and the proxy churn) every cycle."""
+        Checks FREQUENTLY (every HEARTBEAT_CHECK seconds) and pings the moment
+        the link has been idle for KEEPALIVE_INTERVAL. The old version slept a
+        fixed KEEPALIVE_INTERVAL between checks, so a check that landed just
+        before the idle threshold skipped, and the *next* check fell ~2×
+        KEEPALIVE_INTERVAL out — past the 36s firmware drop. The link idle-
+        dropped and every command then paid a full (sometimes minute-long)
+        reconnect. Frequent checks guarantee the ping lands inside the window.
+
+        The ping is fire-and-forget (wait_response=False): the write alone resets
+        the firmware idle timer and it doesn't hold the op lock waiting ~6s for a
+        reply, so it never blocks a user command."""
         try:
             while True:
-                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                await asyncio.sleep(HEARTBEAT_CHECK)
                 if self._client is None or not self._client.is_connected:
                     continue
                 if (monotonic() - self._last_op) < KEEPALIVE_INTERVAL:
                     continue
                 try:
-                    await self._request(frame_unit_prime())
+                    await self._request(frame_unit_prime(), wait_response=False)
                     _LOGGER.debug("keepalive ping ok for %s", self.address)
                 except Exception as exc:  # noqa: BLE001
                     _LOGGER.debug(
@@ -380,13 +436,66 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._fail_count:
             _LOGGER.info("poll recovered after %d failure(s)", self._fail_count)
         self._fail_count = 0
+        self._auth_failing = False
         if self.update_interval != POLL_INTERVAL:
             self.update_interval = POLL_INTERVAL
+        if self._issue_raised:
+            self._clear_repair_issue()
+
+    def _raise_repair_issue(self) -> None:
+        """Surface a one-shot Repair pointing the user at Reconfigure to re-pair.
+
+        Idempotent (HA dedupes by issue_id) and wrapped so it can never break a
+        poll. Raised once per coordinator life on a CCCD-auth failure; cleared on
+        the first good poll."""
+        if self._issue_raised:
+            return
+        try:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"bond_lost_{self.entry.entry_id}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="bond_lost",
+                translation_placeholders={"name": self.entry.title or self.address},
+            )
+            self._issue_raised = True
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("could not raise repair issue: %s", exc)
+
+    def _clear_repair_issue(self) -> None:
+        try:
+            ir.async_delete_issue(
+                self.hass, DOMAIN, f"bond_lost_{self.entry.entry_id}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("could not clear repair issue: %s", exc)
+        self._issue_raised = False
 
     def _on_disconnected(self, client: BleakClient) -> None:
         _LOGGER.debug("BLE disconnect from %s", self.address)
         self._client = None
         self._state["available"] = False
+        # The device/proxy drops the link periodically (shared-radio flakiness).
+        # Don't wait out the poll backoff (up to BACKOFF_MAX) to come back — that
+        # leaves state stale and commands slow for tens of seconds. Reconnect
+        # eagerly so the link is almost always up and commands ride it live.
+        if not self._closing:
+            self.hass.async_create_task(self._eager_reconnect())
+
+    async def _eager_reconnect(self) -> None:
+        await asyncio.sleep(1.0)  # let the drop settle before re-dialling
+        if self._closing or (self._client is not None and self._client.is_connected):
+            return
+        _LOGGER.debug("eager reconnect after drop for %s", self.address)
+        # Reset the backoff so the refresh fires now, not after the grown
+        # interval; async_request_refresh reconnects via _ensure_connected.
+        self.update_interval = POLL_INTERVAL
+        try:
+            await self.async_request_refresh()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("eager reconnect refresh raised: %s", exc)
 
     async def _disconnect(self) -> None:
         if self._client is not None:
@@ -461,6 +570,16 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             frame = await self._request(frame_unit_prime())
         except UpdateFailed:
             self._note_failure()
+            # A CCCD-auth failure means the SMP bond is gone. We do NOT raise
+            # ConfigEntryAuthFailed here: raising it on every poll makes HA
+            # reload the entry in a tight loop, which re-grabs the proxy slot
+            # every couple of seconds and starves the re-pair flow's bond attempt
+            # (it just spins). Instead we stay quiet and let the backoff settle
+            # to 120s so the slot is free; the user re-pairs from the device's
+            # ⋮ → Reconfigure menu (config_flow → bonding.async_seed_bond), and a
+            # Repair issue (raised once below) points them there.
+            if self._auth_failing:
+                self._raise_repair_issue()
             raise
         except Exception as e:  # noqa: BLE001
             self._note_failure()
@@ -612,6 +731,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except UpdateFailed as e:
             _LOGGER.error("turn-off-all failed: %s", e)
             raise
+        self.async_set_updated_data(self._state)  # reflect immediately
         self.hass.async_create_task(self.async_request_refresh())
 
     async def _send_temperature_frame(self) -> None:
@@ -656,6 +776,11 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except UpdateFailed as e:
             _LOGGER.error("set-temperature failed: %s", e)
             raise
-        # Pull fresh state in the background so HA reflects the change without
-        # making the user wait on it.
+        # Reflect the optimistic state to the entities IMMEDIATELY. _state was
+        # already updated to the desired values by the caller; without pushing it
+        # here the UI sits on the old value until the device answers the confirm
+        # poll, which can take several seconds on this slow device — that was the
+        # whole "button press takes seconds to show" lag. The background refresh
+        # below then reconciles against device truth (and corrects if it differs).
+        self.async_set_updated_data(self._state)
         self.hass.async_create_task(self.async_request_refresh())
