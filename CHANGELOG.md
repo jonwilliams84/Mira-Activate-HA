@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.17] - 2026-06-05
+
+A ground-up fix of the Activate's BLE auth, connection stability, and command
+latency, after a fresh reverse-engineering pass over the APK and the HCI capture.
+The headline discovery corrects a long-standing wrong assumption in our own docs:
+**over an ESPHome Bluetooth proxy the cached SMP bond's key is _not_ applied
+automatically on a new connection — you must `pair()` on every connect to
+re-arm encryption, or the CCCD subscribe fails with Insufficient authentication.**
+
+### Fixed
+- **CCCD `Insufficient authentication` even with a valid bond.** The coordinator
+  now calls `client.pair()` immediately before subscribing the notify CCCD on
+  every connect. Over a proxy the stored LTK is dormant until pairing is
+  (re)triggered; when the bond already exists this just starts encryption — no
+  re-bond, no pairing mode, no user action. This is the opposite of the old
+  "skip pair() on the happy path" advice, which was wrong for the proxy path.
+- **Self-inflicted bond destruction.** Removed the automatic `pair()`/bond-cache-
+  clear "recovery" from the hot path entirely. A CCCD auth failure now disconnects
+  and retries the *connection* — it never touches the SMP bond. (The destructive
+  loop is the same class of bug as the reverted 0.1.6 regression, but it had crept
+  back into the auth-failure path and was wiping the bond on a loop.)
+- **The link dropped every ~35 s, making commands take up to a minute.** The
+  keepalive slept a fixed interval between checks, so it kept missing the firmware's
+  ~36 s idle-drop window. It now checks every 5 s and pings (fire-and-forget) the
+  moment the link has been idle ~20 s, so the link is held continuously.
+- **Periodic mid-poll link drops.** Supervision timeout raised to 20 s
+  (`CONN_TIMEOUT=2000`); the Activate stalls (>10 s with no `0x2B` reply) when
+  idle and a short supervision tore the link down during the stall.
+- **Slow recovery after a drop.** Added eager reconnect: on an unexpected
+  disconnect the coordinator reconnects within ~2 s instead of waiting out the
+  poll backoff (which could be tens of seconds).
+- **"Button press takes several seconds to show."** User commands now push
+  optimistic state to the entities the instant the write is sent, then reconcile
+  against device truth on the next poll — the UI no longer waits on the device's
+  slow `0x2B` confirm.
+- **Polls overlapping and cancelling each other** (`CancelledError` drops). Poll
+  interval raised 10 s → 25 s; the `0x2B` reply takes ~6 s, so a 10 s cadence made
+  the next poll cancel the in-flight one.
+
+### Added
+- **Bonding lives in the config flow.** A new guided `pair_confirm` step
+  ("put the shower into pairing mode, then Submit") seeds/repairs the SMP bond
+  from inside HA's bluetooth stack — discovery, manual add, **re-auth** (auto-
+  surfaced when the bond is lost, via a Repairs issue) and **reconfigure** all
+  funnel through it. New `bonding.py::async_seed_bond` does the connect → `pair()`
+  → CCCD-subscribe verification, unloading the entry first so the coordinator
+  releases the proxy's connection slot.
+- **`translations/en.json`** — HA renders config-flow text from here, not
+  `strings.json`; without it the pairing step rendered as a blank form.
+
+### Changed
+- Connection interval loosened from a pinned 15 ms to 30–75 ms
+  (`FAST_MIN/MAX_INTERVAL`). The app's 15 ms (from the HCI capture) overloads a
+  proxy radio shared with the Mira Mode unit and presence scanning; a
+  fire-and-return command's write goes out within one interval regardless, so
+  30–75 ms is imperceptible and far more stable. Stability beats raw interval.
+- Poll backoff cap lowered 120 s → 30 s; eager reconnect is now the primary path
+  back after a drop.
+- Bond verification accepts a successful CCCD subscribe as proof of the bond
+  (plus a best-effort `0x2B` round-trip), rather than requiring an exact `0x2B`
+  opcode echo — the device legitimately answers with an unsolicited status frame
+  first, which a strict check wrongly rejected.
+
 ## [0.1.7] - 2026-06-04
 
 ### Fixed
