@@ -303,6 +303,12 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("pair() on connect raised (continuing): %s", exc)
 
+        # IMPORTANT: After pair(), we must wait for the encryption to actually 
+        # engage on the link before attempting the CCCD write. The BLE stack 
+        # may return from pair() immediately while the LL_ENC_REQ is still 
+        # in flight or the link is transitioning to encrypted state.
+        await asyncio.sleep(0.5)
+
         try:
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
         except Exception as exc:  # noqa: BLE001
