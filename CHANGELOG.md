@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.18] - 2026-06-20
+
+Fixes the "every couple of days the connection dies and jams up the proxy"
+failure mode. Two root causes found and fixed, plus a hardening pass on the
+reconnect logic.
+
+### Fixed
+- **Stuck-connection jamming the proxy slot.** The BLE link could go
+  ATT-alive (`is_connected == True`) but application-dead (the Mira firmware
+  stops responding to `0x2B` polls). The keepalive's fire-and-forget write
+  succeeds at the ATT layer regardless, so nobody detected the stall. The
+  proxy slot was held hostage by a dead connection indefinitely. After 2
+  consecutive poll timeouts while `is_connected`, the coordinator now
+  force-disconnects so the next poll reconnects fresh.
+- **Address rotation kills the poll path permanently.** The re-resolution
+  logic in `_get_ble_device` was correct but unreachable: `_async_update_data`
+  gated on `async_address_present(self.address)` *before* `_connect` was
+  called, so when the Activate rotated its BLE address (power-cycle), the old
+  address was gone, the gate returned False, and the integration died
+  permanently. A new `_maybe_follow_address_rotation` method now runs the
+  name-id scan *before* the availability check, updates `self.address`
+  in-place, and re-registers the BT callback on the new address.
+- **500ms settle after `pair()` before CCCD subscribe.** The BLE stack can
+  return from `pair()` before the `LL_ENC_REQ`/`LL_ENC_RSP` handshake
+  completes. A subscribe landing mid-handshake returns `Insufficient
+  authentication` — indistinguishable from a missing bond. Matches the
+  official app's post-`createBond` delay.
+- **Eager-reconnect dedup.** Multiple rapid disconnects could schedule
+  overlapping `_eager_reconnect` tasks. A `_reconnecting` guard now prevents
+  this.
+
 ## [0.1.17] - 2026-06-05
 
 A ground-up fix of the Activate's BLE auth, connection stability, and command
