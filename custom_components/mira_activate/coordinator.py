@@ -114,6 +114,12 @@ CONN_TIMEOUT = 2000      # 20.0 s supervision. The Activate stalls (no 0x2B repl
 BACKOFF_MAX = timedelta(seconds=30)  # a shower should recover fast; eager
                                      # reconnect-on-drop is the primary path back
 
+# Stuck-connection threshold: if this many consecutive polls time out while
+# the client reports is_connected, the link is application-dead (firmware
+# stalled, proxy slot jammed) but ATT-alive — nobody will drop it for us.
+# Force-disconnect so the next poll reconnects fresh and frees the proxy slot.
+STUCK_DISCONNECT_THRESHOLD = 2
+
 
 class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """One-connection-per-device coordinator."""
@@ -151,9 +157,11 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._heartbeat_task: asyncio.Task | None = None
         self._last_op: float = 0.0  # monotonic ts of last successful round-trip
         self._fail_count: int = 0   # consecutive poll failures (drives backoff)
+        self._stuck_count: int = 0  # consecutive timeouts while is_connected
         self._auth_failing: bool = False  # last failure was CCCD auth (bond lost)
         self._issue_raised: bool = False  # repair issue (bond lost) is showing
         self._closing: bool = False  # set on async_close to stop eager reconnect
+        self._reconnecting: bool = False  # dedup guard for _eager_reconnect
         # Cached state pushed to entities (see AB_2B_DECODE.md).
         # outlet1_on / outlet2_on / outlet0_on are booleans driven by the
         # bit-packed outlet_state byte in payload[13]. flow_lpm is what we'll
@@ -241,6 +249,48 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
         return dev
 
+    async def _maybe_follow_address_rotation(self) -> None:
+        """Check whether the Activate has rotated its BLE address and follow it.
+
+        The Activate regenerates its random BLE address on power-cycle. The
+        re-resolution logic in _get_ble_device handles this *inside* the
+        connection path, but _async_update_data gates on
+        async_address_present(self.address) *before* reaching _connect — so
+        with the old address the poll path returns early and the re-resolution
+        is never triggered. This method runs the same name-id scan up front
+        and updates self.address if the unit is now advertising under a new one.
+
+        Also re-registers the BT availability callback on the new address so
+        _on_bt_advertisement fires for the rotated identity.
+        """
+        if not self._device_id:
+            return
+        if async_address_present(self.hass, self.address, connectable=True):
+            return  # old address still seen — no rotation
+        for info in async_discovered_service_info(self.hass):
+            if (
+                info.connectable
+                and SERVICE_UUID in info.service_uuids
+                and device_id_from_name(info.name) == self._device_id
+            ):
+                if info.address != self.address:
+                    _LOGGER.warning(
+                        "Activate %s address rotated %s -> %s (poll path); following",
+                        self._device_id, self.address, info.address,
+                    )
+                    self.address = info.address
+                    # Re-register the BT callback on the new address so
+                    # availability tracking follows the rotation.
+                    if self._unsub_bt_callback is not None:
+                        self._unsub_bt_callback()
+                    self._unsub_bt_callback = async_register_callback(
+                        self.hass,
+                        self._on_bt_advertisement,
+                        BluetoothCallbackMatcher(address=self.address),
+                        BluetoothScanningMode.PASSIVE,
+                    )
+                return
+
     async def _ensure_connected(self) -> BleakClient:
         if self._client is not None and self._client.is_connected:
             return self._client
@@ -302,6 +352,12 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await client.pair()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("pair() on connect raised (continuing): %s", exc)
+
+        # IMPORTANT: After pair(), we must wait for the encryption to actually 
+        # engage on the link before attempting the CCCD write. The BLE stack 
+        # may return from pair() immediately while the LL_ENC_REQ is still 
+        # in flight or the link is transitioning to encrypted state.
+        await asyncio.sleep(0.5)
 
         try:
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
@@ -436,6 +492,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._fail_count:
             _LOGGER.info("poll recovered after %d failure(s)", self._fail_count)
         self._fail_count = 0
+        self._stuck_count = 0
         self._auth_failing = False
         if self.update_interval != POLL_INTERVAL:
             self.update_interval = POLL_INTERVAL
@@ -481,21 +538,26 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Don't wait out the poll backoff (up to BACKOFF_MAX) to come back — that
         # leaves state stale and commands slow for tens of seconds. Reconnect
         # eagerly so the link is almost always up and commands ride it live.
-        if not self._closing:
+        # Guard against multiple drops scheduling overlapping reconnect tasks.
+        if not self._closing and not self._reconnecting:
+            self._reconnecting = True
             self.hass.async_create_task(self._eager_reconnect())
 
     async def _eager_reconnect(self) -> None:
-        await asyncio.sleep(1.0)  # let the drop settle before re-dialling
-        if self._closing or (self._client is not None and self._client.is_connected):
-            return
-        _LOGGER.debug("eager reconnect after drop for %s", self.address)
-        # Reset the backoff so the refresh fires now, not after the grown
-        # interval; async_request_refresh reconnects via _ensure_connected.
-        self.update_interval = POLL_INTERVAL
         try:
-            await self.async_request_refresh()
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("eager reconnect refresh raised: %s", exc)
+            await asyncio.sleep(1.0)  # let the drop settle before re-dialling
+            if self._closing or (self._client is not None and self._client.is_connected):
+                return
+            _LOGGER.debug("eager reconnect after drop for %s", self.address)
+            # Reset the backoff so the refresh fires now, not after the grown
+            # interval; async_request_refresh reconnects via _ensure_connected.
+            self.update_interval = POLL_INTERVAL
+            try:
+                await self.async_request_refresh()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("eager reconnect refresh raised: %s", exc)
+        finally:
+            self._reconnecting = False
 
     async def _disconnect(self) -> None:
         if self._client is not None:
@@ -563,6 +625,14 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Poll the device (one 0x2B Unit Prime read per cycle)."""
+        # Try to re-resolve the address first (the Activate regenerates its
+        # random BLE address on power-cycle). _get_ble_device follows the
+        # rotation by name-id; if the stored address is gone but the unit is
+        # advertising under a new one, self.address is updated in-place.
+        # Only after re-resolution do we check availability — checking the
+        # *old* address gates here and the integration dies permanently on
+        # a rotation because the re-resolution code is never reached.
+        await self._maybe_follow_address_rotation()
         if not async_address_present(self.hass, self.address, connectable=True):
             self._state["available"] = False
             return self._state
@@ -570,6 +640,24 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             frame = await self._request(frame_unit_prime())
         except UpdateFailed:
             self._note_failure()
+            # Stuck-connection detection: if the client still reports
+            # is_connected after a timeout, the link is application-dead
+            # but ATT-alive — the proxy slot is jammed and nobody will drop
+            # it for us. Force-disconnect so the next poll reconnects fresh.
+            # This is the primary fix for the "every couple of days the
+            # connection dies and jams up the proxy" failure mode.
+            if self._client is not None and self._client.is_connected:
+                self._stuck_count += 1
+                if self._stuck_count >= STUCK_DISCONNECT_THRESHOLD:
+                    _LOGGER.warning(
+                        "link stuck (x%d timeouts while connected) — "
+                        "force-disconnecting %s to free proxy slot",
+                        self._stuck_count, self.address,
+                    )
+                    self._stuck_count = 0
+                    await self._disconnect()
+            else:
+                self._stuck_count = 0
             # A CCCD-auth failure means the SMP bond is gone. We do NOT raise
             # ConfigEntryAuthFailed here: raising it on every poll makes HA
             # reload the entry in a tight loop, which re-grabs the proxy slot
@@ -584,6 +672,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as e:  # noqa: BLE001
             self._note_failure()
             raise UpdateFailed(f"poll failed: {e}") from e
+        self._stuck_count = 0
         self._note_success()
         # Parse the 0x2B response per AB_2B_DECODE.md §2.
         if frame is not None:

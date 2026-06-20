@@ -279,6 +279,22 @@ flow. Things that cost time during development and are worth knowing:
 - **Reconnect eagerly on an unexpected drop** rather than waiting out the poll
   backoff — the device/proxy will drop the link occasionally no matter what, so
   make the drop invisible (~2 s back) instead of trying to eliminate it.
+- **Detect stuck connections and force-disconnect.** The most insidious failure
+  mode is a link that is ATT-alive (`is_connected == True`) but application-dead
+  (the device stops responding to `0x2B` polls). The keepalive's fire-and-forget
+  write succeeds at the ATT layer regardless, and `_ensure_connected` sees
+  `is_connected == True` so it never reconnects. The proxy slot is jammed
+  indefinitely. After 2 consecutive poll timeouts while `is_connected`, the
+  coordinator force-disconnects the client so the next poll reconnects fresh.
+  This is the fix for the "every couple of days the connection dies and jams up
+  the proxy" symptom.
+- **Handle BLE address rotation in the poll path, not just the connection path.**
+  The re-resolution logic in `_get_ble_device` follows an address rotation by
+  name-id, but `_async_update_data` gates on `async_address_present(self.address)`
+  *before* `_connect` is ever called. With the old address, the gate returns
+  false and the re-resolution is unreachable — the integration dies permanently
+  on a power-cycle. Run the name-id scan *before* the availability check, update
+  `self.address` in-place, and re-register the BT callback on the new address.
 - **`outlets = 0x04` does nothing**. Bit 2 is not a valid outlet bit and
   sending it makes the device ignore the whole write. Use bits 0/1 only.
 - **Echo the device's `flow` byte back on writes** unless the user has

@@ -1,7 +1,7 @@
 {
   "domain": "mira_activate",
   "name": "Mira Activate Shower",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "codeowners": [
     "@jonwilliams84"
   ],
