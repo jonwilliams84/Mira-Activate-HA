@@ -120,6 +120,19 @@ BACKOFF_MAX = timedelta(seconds=30)  # a shower should recover fast; eager
 # Force-disconnect so the next poll reconnects fresh and frees the proxy slot.
 STUCK_DISCONNECT_THRESHOLD = 2
 
+# Proxy-wedged discriminator (RCA 2026-07-23): a genuinely lost bond and a
+# wedged proxy BLE stack produce the SAME symptom at this layer — connect
+# succeeds, pair() silently fails to bring encryption up, CCCD subscribe
+# returns Insufficient authentication. But the fixes are opposite: a lost
+# bond needs a panel re-pair; a wedged proxy just needs the proxy rebooted
+# (re-pairing is pointless and risky). Discriminator: if auth failures have
+# persisted continuously for this long WHILE the device is still advertising
+# and connectable, the bond store on the proxy is almost certainly wedged
+# (e.g. degraded NimBLE state after a panic reboot) — raise proxy_wedged,
+# not bond_lost. A real bond loss right after pairing is caught well before
+# this window as bond_lost.
+PROXY_WEDGE_AFTER = timedelta(hours=1)
+
 
 class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """One-connection-per-device coordinator."""
@@ -159,7 +172,9 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._fail_count: int = 0   # consecutive poll failures (drives backoff)
         self._stuck_count: int = 0  # consecutive timeouts while is_connected
         self._auth_failing: bool = False  # last failure was CCCD auth (bond lost)
+        self._auth_fail_since: float | None = None  # monotonic ts of first auth failure in current streak
         self._issue_raised: bool = False  # repair issue (bond lost) is showing
+        self._wedge_issue_raised: bool = False  # repair issue (proxy wedged) is showing
         self._closing: bool = False  # set on async_close to stop eager reconnect
         self._reconnecting: bool = False  # dedup guard for _eager_reconnect
         # Cached state pushed to entities (see AB_2B_DECODE.md).
@@ -377,6 +392,8 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or "Insufficient authorization" in msg
             ):
                 self._auth_failing = True
+                if self._auth_fail_since is None:
+                    self._auth_fail_since = monotonic()
                 raise UpdateFailed(
                     f"CCCD auth not available for {self.address} "
                     "(bond temporarily unusable — will retry, bond left intact)"
@@ -494,10 +511,13 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._fail_count = 0
         self._stuck_count = 0
         self._auth_failing = False
+        self._auth_fail_since = None
         if self.update_interval != POLL_INTERVAL:
             self.update_interval = POLL_INTERVAL
         if self._issue_raised:
             self._clear_repair_issue()
+        if self._wedge_issue_raised:
+            self._clear_wedge_issue()
 
     def _raise_repair_issue(self) -> None:
         """Surface a one-shot Repair pointing the user at Reconfigure to re-pair.
@@ -529,6 +549,49 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("could not clear repair issue: %s", exc)
         self._issue_raised = False
+
+    def _raise_wedge_issue(self) -> None:
+        """Surface a Repair saying the PROXY is wedged — restart it, don't re-pair.
+
+        Raised when CCCD-auth failures have persisted past PROXY_WEDGE_AFTER
+        while the device is still advertising and connectable (see the
+        PROXY_WEDGE_AFTER comment for the RCA). Supersedes bond_lost: the
+        misleading "re-pair" advice is withdrawn so the user isn't sent to
+        the panel for nothing."""
+        if self._wedge_issue_raised:
+            return
+        try:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"proxy_wedged_{self.entry.entry_id}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="proxy_wedged",
+                translation_placeholders={"name": self.entry.title or self.address},
+            )
+            self._wedge_issue_raised = True
+            # Withdraw the bond_lost issue — its re-pair advice is wrong here.
+            if self._issue_raised:
+                self._clear_repair_issue()
+            _LOGGER.warning(
+                "%s: CCCD auth failing for over %s while the unit is still "
+                "advertising — BLE proxy stack looks wedged; restart the proxy "
+                "(do NOT re-pair)",
+                self.address,
+                PROXY_WEDGE_AFTER,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("could not raise wedge issue: %s", exc)
+
+    def _clear_wedge_issue(self) -> None:
+        try:
+            ir.async_delete_issue(
+                self.hass, DOMAIN, f"proxy_wedged_{self.entry.entry_id}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("could not clear wedge issue: %s", exc)
+        self._wedge_issue_raised = False
 
     def _on_disconnected(self, client: BleakClient) -> None:
         _LOGGER.debug("BLE disconnect from %s", self.address)
@@ -667,7 +730,22 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # ⋮ → Reconfigure menu (config_flow → bonding.async_seed_bond), and a
             # Repair issue (raised once below) points them there.
             if self._auth_failing:
-                self._raise_repair_issue()
+                # Discriminate wedged proxy from lost bond: auth failing for
+                # over PROXY_WEDGE_AFTER while the device is STILL advertising
+                # and connectable means the proxy's BLE/bond stack is wedged
+                # (restart the proxy) — not a lost bond (re-pair). See the
+                # PROXY_WEDGE_AFTER comment for the 2026-07-23 RCA.
+                if (
+                    self._auth_fail_since is not None
+                    and (monotonic() - self._auth_fail_since)
+                    >= PROXY_WEDGE_AFTER.total_seconds()
+                    and async_address_present(
+                        self.hass, self.address, connectable=True
+                    )
+                ):
+                    self._raise_wedge_issue()
+                else:
+                    self._raise_repair_issue()
             raise
         except Exception as e:  # noqa: BLE001
             self._note_failure()

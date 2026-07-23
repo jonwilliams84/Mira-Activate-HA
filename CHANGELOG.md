@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.19] - 2026-07-23
+
+### Added
+- **`proxy_wedged` repair issue — wedged-proxy vs lost-bond discrimination.**
+  RCA of the 16–23 Jul 2026 outage: the shared ESPHome proxy crashed
+  (`exception/panic`), rebooted, and came back with a wedged BLE stack —
+  connects succeeded but `pair()` silently failed to bring encryption up, so
+  every CCCD subscribe returned Insufficient authentication for 7 days. The
+  existing `bond_lost` repair told the user to re-pair, which was wrong (and
+  risky) — the bonds were intact the whole time; restarting the proxy fixed
+  both units in minutes with zero re-pairing.
+  The coordinator now tracks how long the CCCD-auth failure streak has run
+  (`_auth_fail_since`). If it exceeds `PROXY_WEDGE_AFTER` (1 h) **while the
+  device is still advertising and connectable**, it raises a distinct
+  `proxy_wedged` repair ("restart the BLE proxy — do NOT re-pair") and
+  withdraws `bond_lost`. Short-lived auth failures still raise `bond_lost`
+  as before. Both issues clear on the first good poll.
+
 ## [0.1.18] - 2026-06-20
 
 Fixes the "every couple of days the connection dies and jams up the proxy"
