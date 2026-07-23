@@ -31,6 +31,10 @@
     "bond_lost": {
       "title": "{name} needs re-pairing",
       "description": "The Bluetooth security bond to {name} was lost, so the shower can't be controlled.\n\nTo fix it: put the shower into pairing mode at the panel, then go to Settings → Devices & Services → Mira Activate → the device's ⋮ menu → **Reconfigure**, and follow the on-screen steps."
+    },
+    "proxy_wedged": {
+      "title": "{name}: BLE proxy appears wedged — restart the proxy",
+      "description": "The security bond to {name} has been failing for over an hour even though the shower is still advertising and connectable. This pattern means the ESPHome BLE proxy's Bluetooth stack is wedged (commonly after a crash/panic reboot) — the bond itself is almost certainly intact.\n\n**Do NOT re-pair.** Restart the BLE proxy instead (its Restart button in Home Assistant, or power-cycle it). The shower should recover within a few minutes of the proxy coming back."
     }
   }
 }
