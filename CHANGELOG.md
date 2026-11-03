@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.20] - 2026-11-03
+
+### Changed
+- **Dynamic connection interval modulation (idle vs active)**: Mirrors the official
+  Android app (`uk.co.mirashowers` v5.6 BTSnoop trace analysis). When water is running
+  or user commands are issued, connection parameters remain tight (`30–75ms`). When
+  idle, connection parameters relax to `500–1000ms`, reducing BLE radio airtime by ~90%
+  and preventing RF collision/contention on shared proxies with multiple BLE peripherals.
+
+### Fixed
+- **Auth-failure reconnect storm and exponential backoff**: When CCCD authentication
+  fails, `_on_disconnected` eager reconnect is suppressed, and poll intervals back off
+  exponentially up to `AUTH_BACKOFF_MAX` (5 minutes) instead of spinning every 30 seconds.
+  This allows the proxy BLE stack to clear its packet buffers and self-heal without
+  starving companion BLE devices.
+- **Persistent repair issue cleanup**: In `_note_success`, `_clear_repair_issue()` and
+  `_clear_wedge_issue()` are now called unconditionally on successful poll, ensuring
+  stale `bond_lost` repair notifications in Home Assistant's persistent registry are
+  reliably removed upon recovery even after coordinator reloads.
+
 ## [0.1.19] - 2026-07-23
 
 ### Added
