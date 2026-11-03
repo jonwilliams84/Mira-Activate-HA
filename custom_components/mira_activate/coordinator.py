@@ -384,19 +384,24 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # currently usable on this connection — DO NOT pair()/clear-cache.
             # Drop the client so the next poll reconnects (backoff handles the
             # cadence); the bond is left intact for when it becomes available.
+            # Flag the auth failure BEFORE disconnecting: the disconnect callback
+            # checks _auth_failing to skip the eager reconnect, and on the first
+            # failure of a streak it would otherwise still be False.
+            msg = str(exc)
+            auth_fail = (
+                "Insufficient authentication" in msg
+                or "Insufficient authorization" in msg
+            )
+            if auth_fail:
+                self._auth_failing = True
+                if self._auth_fail_since is None:
+                    self._auth_fail_since = monotonic()
             try:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
             self._client = None
-            msg = str(exc)
-            if (
-                "Insufficient authentication" in msg
-                or "Insufficient authorization" in msg
-            ):
-                self._auth_failing = True
-                if self._auth_fail_since is None:
-                    self._auth_fail_since = monotonic()
+            if auth_fail:
                 raise UpdateFailed(
                     f"CCCD auth not available for {self.address} "
                     "(bond temporarily unusable — will retry, bond left intact)"
@@ -414,12 +419,12 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Pin fast (active) or relaxed (idle) LE connection params via ESPHome proxy.
 
-        Mirrors the official app, which drives the link at a tight interval
-        while communicating and relaxes to a multi-second window when idle.
-        Fast params (30-75ms) provide immediate responsiveness for commands
-        and active water flow; relaxed params (500-1000ms) cut radio airtime
-        by ~90% when idle, preventing contention on shared proxies with multiple
-        BLE devices.
+        Follows the shape of the official app, which runs the link at 15ms
+        while talking and ~4s when idle (docs/PROTOCOL.md §3.2). Fast params
+        (30-75ms) cover commands and active water flow; idle params
+        (500-1000ms) are a gentler step than the app's 4s, so a poll or
+        command landing while idle still goes out within a second, and they
+        free most of the airtime on a shared proxy.
         Reaches the bleak-esphome backend's set_connection_params (proxy firmware
         >= ESPHome 2025.x with CONNECTION_PARAMS_SETTING flag). Best-effort — never fatal.
         """

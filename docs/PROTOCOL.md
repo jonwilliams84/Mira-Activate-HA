@@ -271,6 +271,10 @@ flow. Things that cost time during development and are worth knowing:
   20 s supervision). Do **not** pin the app's 15 ms interval over a proxy — it
   overloads a radio shared with other devices/scanning and destabilises the link
   for no real gain (a fire-and-return write goes out within one interval anyway).
+  Since 0.1.20 the integration also relaxes to `min=400, max=800, timeout=3000`
+  (500–1000 ms, 30 s supervision) while nothing is running, and pins the fast
+  set again when water runs or a command turns an outlet on — the app's
+  idle/active shape, with a gentler idle step than its ~4 s.
 - **Keep the link alive with a frequent-check keepalive.** The firmware idle-
   drops after ~36 s. Check every ~5 s and send a fire-and-forget `0x2B` once the
   link has been idle ~20 s. A keepalive that *sleeps* a fixed ~20 s between checks
