@@ -99,20 +99,22 @@ HEARTBEAT_CHECK = 5.0      # how often the heartbeat re-checks idle time; small
 # connection interval anyway, so 30-75ms is imperceptible while being far gentler
 # on the shared proxy. Stability (link stays UP) beats raw interval for perceived
 # responsiveness — a held link makes every command instant.
-FAST_MIN_INTERVAL = 24   # 30.0 ms
-FAST_MAX_INTERVAL = 60   # 75.0 ms  (gives the shared proxy real slack)
+FAST_MIN_INTERVAL = 24    # 30.0 ms (active water flow / user commands)
+FAST_MAX_INTERVAL = 60    # 75.0 ms
+IDLE_MIN_INTERVAL = 400   # 500.0 ms (relaxed idle window — cuts radio contention by ~90%)
+IDLE_MAX_INTERVAL = 800   # 1000.0 ms
 CONN_LATENCY = 0
-CONN_TIMEOUT = 2000      # 20.0 s supervision. The Activate stalls (no 0x2B reply
-                         # for >10s) when idle; a short supervision timeout then
-                         # tears the link down mid-poll. A long one lets the link
-                         # ride out the stall instead of dropping + reconnecting.
+CONN_TIMEOUT_FAST = 2000  # 20.0 s supervision during active session
+CONN_TIMEOUT_IDLE = 3000  # 30.0 s supervision while idle (matches idle window)
+CONN_TIMEOUT = CONN_TIMEOUT_FAST  # backwards compatibility
 
 # When polls keep failing (marginal RF / broken bond), backing off stops the
-# 10s reconnect churn from hammering a struggling link and flooding the log.
+# reconnect churn from hammering a struggling link and flooding the log.
 # Interval doubles per consecutive failure up to this cap, then resets on the
 # first good poll.
 BACKOFF_MAX = timedelta(seconds=30)  # a shower should recover fast; eager
                                      # reconnect-on-drop is the primary path back
+AUTH_BACKOFF_MAX = timedelta(minutes=5)  # cap for CCCD auth failure backoff to avoid radio storm
 
 # Stuck-connection threshold: if this many consecutive polls time out while
 # the client reports is_connected, the link is application-dead (firmware
@@ -175,6 +177,7 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._auth_fail_since: float | None = None  # monotonic ts of first auth failure in current streak
         self._issue_raised: bool = False  # repair issue (bond lost) is showing
         self._wedge_issue_raised: bool = False  # repair issue (proxy wedged) is showing
+        self._conn_profile: str = "fast"  # active connection param profile: "fast" or "idle"
         self._closing: bool = False  # set on async_close to stop eager reconnect
         self._reconnecting: bool = False  # dedup guard for _eager_reconnect
         # Cached state pushed to entities (see AB_2B_DECODE.md).
@@ -381,19 +384,24 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # currently usable on this connection — DO NOT pair()/clear-cache.
             # Drop the client so the next poll reconnects (backoff handles the
             # cadence); the bond is left intact for when it becomes available.
+            # Flag the auth failure BEFORE disconnecting: the disconnect callback
+            # checks _auth_failing to skip the eager reconnect, and on the first
+            # failure of a streak it would otherwise still be False.
+            msg = str(exc)
+            auth_fail = (
+                "Insufficient authentication" in msg
+                or "Insufficient authorization" in msg
+            )
+            if auth_fail:
+                self._auth_failing = True
+                if self._auth_fail_since is None:
+                    self._auth_fail_since = monotonic()
             try:
                 await client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
             self._client = None
-            msg = str(exc)
-            if (
-                "Insufficient authentication" in msg
-                or "Insufficient authorization" in msg
-            ):
-                self._auth_failing = True
-                if self._auth_fail_since is None:
-                    self._auth_fail_since = monotonic()
+            if auth_fail:
                 raise UpdateFailed(
                     f"CCCD auth not available for {self.address} "
                     "(bond temporarily unusable — will retry, bond left intact)"
@@ -406,30 +414,54 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug("BLE link to %s up + notify subscribed", self.address)
         return client
 
-    async def _set_fast_connection_params(self, client: BleakClient) -> None:
-        """Pin a tight LE connection interval via the ESPHome proxy.
+    async def _set_connection_params(
+        self, client: BleakClient | None = None, *, fast: bool = True
+    ) -> None:
+        """Pin fast (active) or relaxed (idle) LE connection params via ESPHome proxy.
 
-        Mirrors the official app, which drives the link at a ~15ms interval
-        while it's talking (HCI capture). Reaches the bleak-esphome backend's
-        set_connection_params (proxy firmware ≥ ESPHome 2025.x with the
-        CONNECTION_PARAMS_SETTING flag; older firmware logs a warning and
-        no-ops). Best-effort — never fatal."""
-        backend = getattr(client, "_backend", None)
+        Follows the shape of the official app, which runs the link at 15ms
+        while talking and ~4s when idle (docs/PROTOCOL.md §3.2). Fast params
+        (30-75ms) cover commands and active water flow; idle params
+        (500-1000ms) are a gentler step than the app's 4s, so a poll or
+        command landing while idle still goes out within a second, and they
+        free most of the airtime on a shared proxy.
+        Reaches the bleak-esphome backend's set_connection_params (proxy firmware
+        >= ESPHome 2025.x with CONNECTION_PARAMS_SETTING flag). Best-effort — never fatal.
+        """
+        target_profile = "fast" if fast else "idle"
+        target_client = client or self._client
+        if target_client is None or not target_client.is_connected:
+            return
+
+        if self._conn_profile == target_profile and client is None:
+            return
+
+        backend = getattr(target_client, "_backend", None)
         setter = getattr(backend, "set_connection_params", None)
         if setter is None:
             return
+
+        min_int = FAST_MIN_INTERVAL if fast else IDLE_MIN_INTERVAL
+        max_int = FAST_MAX_INTERVAL if fast else IDLE_MAX_INTERVAL
+        timeout = CONN_TIMEOUT_FAST if fast else CONN_TIMEOUT_IDLE
+
         try:
-            await setter(
-                FAST_MIN_INTERVAL, FAST_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT
-            )
+            await setter(min_int, max_int, CONN_LATENCY, timeout)
+            self._conn_profile = target_profile
             _LOGGER.debug(
-                "pinned fast conn params for %s (%.1f-%.1fms)",
+                "pinned %s conn params for %s (%.1f-%.1fms, timeout=%ds)",
+                target_profile,
                 self.address,
-                FAST_MIN_INTERVAL * 1.25,
-                FAST_MAX_INTERVAL * 1.25,
+                min_int * 1.25,
+                max_int * 1.25,
+                int(timeout * 0.01),
             )
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("set_connection_params best-effort failed: %s", exc)
+
+    async def _set_fast_connection_params(self, client: BleakClient) -> None:
+        """Backwards compatibility helper."""
+        await self._set_connection_params(client, fast=True)
 
     def _proxy_api_client(self, client: BleakClient):
         """Reach the underlying aioesphomeapi APIClient via the bleak-esphome
@@ -494,14 +526,25 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _note_failure(self) -> None:
         """Grow the poll interval on consecutive failures (capped)."""
         self._fail_count += 1
-        secs = min(
-            POLL_INTERVAL.total_seconds() * (2 ** min(self._fail_count, 4)),
-            BACKOFF_MAX.total_seconds(),
-        )
+        if self._auth_failing:
+            # When CCCD auth fails, back off exponentially up to AUTH_BACKOFF_MAX (5 min)
+            # to let the proxy BLE stack quiet down and recover rather than storming the radio.
+            secs = min(
+                30.0 * (2 ** min(self._fail_count - 1, 4)),
+                AUTH_BACKOFF_MAX.total_seconds(),
+            )
+        else:
+            secs = min(
+                POLL_INTERVAL.total_seconds() * (2 ** min(self._fail_count, 4)),
+                BACKOFF_MAX.total_seconds(),
+            )
         self.update_interval = timedelta(seconds=secs)
         if self._fail_count == 1 or self._fail_count % 5 == 0:
             _LOGGER.warning(
-                "poll failing (x%d) — backing off to %ds", self._fail_count, int(secs)
+                "poll failing (x%d, auth_fail=%s) — backing off to %ds",
+                self._fail_count,
+                self._auth_failing,
+                int(secs),
             )
 
     def _note_success(self) -> None:
@@ -514,10 +557,8 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._auth_fail_since = None
         if self.update_interval != POLL_INTERVAL:
             self.update_interval = POLL_INTERVAL
-        if self._issue_raised:
-            self._clear_repair_issue()
-        if self._wedge_issue_raised:
-            self._clear_wedge_issue()
+        self._clear_repair_issue()
+        self._clear_wedge_issue()
 
     def _raise_repair_issue(self) -> None:
         """Surface a one-shot Repair pointing the user at Reconfigure to re-pair.
@@ -596,13 +637,16 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _on_disconnected(self, client: BleakClient) -> None:
         _LOGGER.debug("BLE disconnect from %s", self.address)
         self._client = None
+        self._conn_profile = "fast"
         self._state["available"] = False
         # The device/proxy drops the link periodically (shared-radio flakiness).
         # Don't wait out the poll backoff (up to BACKOFF_MAX) to come back — that
         # leaves state stale and commands slow for tens of seconds. Reconnect
         # eagerly so the link is almost always up and commands ride it live.
-        # Guard against multiple drops scheduling overlapping reconnect tasks.
-        if not self._closing and not self._reconnecting:
+        # Guard against multiple drops scheduling overlapping reconnect tasks,
+        # and do NOT eager-reconnect during an auth-failure streak (let the backoff
+        # settle the radio instead of re-dialling immediately).
+        if not self._closing and not self._reconnecting and not self._auth_failing:
             self._reconnecting = True
             self.hass.async_create_task(self._eager_reconnect())
 
@@ -783,6 +827,18 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._state["available"] = True
         else:
             self._state["available"] = False
+
+        # Modulate connection interval based on active water flow:
+        # If shower is running, pin fast params (30-75ms) for low-latency control.
+        # When idle, relax params (500-1000ms) to cut radio airtime by ~90% on shared proxies.
+        is_running = bool(
+            self._state.get("running")
+            or self._state.get("outlet0_on")
+            or self._state.get("outlet1_on")
+            or self._state.get("outlet2_on")
+        )
+        await self._set_connection_params(fast=is_running)
+
         return self._state
 
     # ---- Public API used by entities ---------------------------------------
@@ -937,6 +993,9 @@ class MiraActivateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             outlet_state,
             frame.hex(),
         )
+        any_outlet_on = bool(self._state.get("outlet0_on") or self._state.get("outlet1_on"))
+        if any_outlet_on:
+            await self._set_connection_params(fast=True)
         try:
             # Fire-and-return so the command lands fast (no 10s ack wait).
             await self._request(frame, wait_response=False)

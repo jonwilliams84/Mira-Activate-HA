@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); versions match
 `custom_components/mira_activate/manifest.json` and the git tags.
 
+## [0.1.20] - 2026-11-03
+
+### Changed
+- **Dynamic connection interval modulation (idle vs active)**: follows the official
+  app's shape (15 ms while talking, ~4 s idle; `docs/PROTOCOL.md` §3.2). While water
+  runs or a command turns an outlet on, the link stays at `30–75ms`. When idle it
+  relaxes to `500–1000ms` with 30 s supervision, freeing most of the airtime on a
+  shared proxy.
+
+### Fixed
+- **Auth-failure reconnect storm and exponential backoff**: When CCCD authentication
+  fails, `_on_disconnected` eager reconnect is suppressed, and poll intervals back off
+  exponentially up to `AUTH_BACKOFF_MAX` (5 minutes) instead of spinning every 30 seconds.
+  This allows the proxy BLE stack to clear its packet buffers and self-heal without
+  starving companion BLE devices. The auth flag is now set before the drop, so the
+  first failure of a streak no longer schedules an eager reconnect either.
+- **Persistent repair issue cleanup**: In `_note_success`, `_clear_repair_issue()` and
+  `_clear_wedge_issue()` are now called unconditionally on successful poll, ensuring
+  stale `bond_lost` repair notifications in Home Assistant's persistent registry are
+  reliably removed upon recovery even after coordinator reloads.
+
 ## [0.1.19] - 2026-07-23
 
 ### Added
